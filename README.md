@@ -22,7 +22,8 @@ It detects, counts, and tracks every worshipper in real time — even in dense p
 
 ## 🎥 Demo
 
-> *(Add a screenshot or GIF of the system running here)*  
+> *(![Uploading demo.gif…]()
+)*  
 > Example: `![Demo](demo.gif)`
 
 ---
