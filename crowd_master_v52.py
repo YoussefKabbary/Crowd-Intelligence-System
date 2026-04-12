@@ -2902,7 +2902,7 @@ class VideoLauncher:
         tk.Button(frm2, text="Change…", command=browse_dir,
                   font=FONT, bg=BTN_BG, fg=ACCENT,
                   relief="flat", padx=10, cursor="hand2").pack(side="left")
-
+"Kabbary"
         # ── Device info ─────────────────────────────────────
         sep = tk.Frame(root, bg="#333", height=1)
         sep.pack(fill="x", padx=24, pady=10)
@@ -3439,4 +3439,4 @@ if __name__ == "__main__":
     logger.info("=" * 70)
 
     run(cfg)
-"Lets start"
+"Lets start from Kabbary"
