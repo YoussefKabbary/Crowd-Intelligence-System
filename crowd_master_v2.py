@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  CROWD MASTER  |  Enterprise AI Surveillance Platform  v5.2         ║
+║  CROWD MASTER  |  Enterprise AI Surveillance Platform  v5.3         ║
 ║  ─────────────────────────────────────────────────────────────────  ║
-║  NEW IN v5.2:                                                        ║
-║    ✓ Tkinter GUI launcher — browse video before run starts         ║
-║    ✓ GPU FP16 (half-precision) — 2× faster on CUDA                 ║
-║    ✓ model.fuse() — fused Conv+BN for faster inference             ║
-║    ✓ torch.backends.cudnn.benchmark = True                         ║
-║    ✓ Center-based tracking (EMA) — no more box trailing            ║
-║    ✓ Head offset prediction — head never lost                      ║
-║    ✓ Adaptive inference resolution based on real FPS               ║
-║    ✓ O key — toggle detection on/off (tracking continues)          ║
-║    ✓ All v5.1 fixes retained                                       ║
+║  NEW IN v5.3  (audit fixes — see AUDIT.md):                          ║
+║    ✓ Tracking is never lost: slicing/TTA now augment the tracked    ║
+║      pass instead of replacing it. Gate counting works again.       ║
+║    ✓ NMS rewritten — it was fed xyxy boxes as xywh and discarded    ║
+║      the weakest detection every frame (~20% undercount).           ║
+║    ✓ TTA flip un-mirror fixed (used to emit boxes with x1 > x2).    ║
+║    ✓ Online learning OFF by default: cost 40-60% of frame rate      ║
+║      and contributed a CNN count of 0 in every logged session.      ║
+║    ✓ Anomaly/drift detectors now see the real frame, not a          ║
+║      constant grey image — panic/stampede alerts can fire at all.   ║
+║    ✓ Forecaster rewritten: true 1 Hz history + robust trend.        ║
+║    ✓ API binds loopback and supports an API key.                    ║
+║    ✓ Headless/batch mode for scripted runs and tests.               ║
+║                                                                      ║
+║  MERGED: crowd_master_v2_gpu_max.py is folded in and deleted.        ║
 ║                                                                      ║
 ║  ARCHITECTURE: 6-Thread async pipeline                               ║
 ║    VideoPlayerThread  → exact-FPS playback, independent            ║
@@ -33,7 +38,8 @@
 ║    G gate-draw   TAB select-gate   R reverse   ESC deselect         ║
 ║    X delete-selected  (X clears all when nothing selected)          ║
 ║    O  toggle detection on/off (tracking keeps running)              ║
-║    +/-  speed   V/C volume   ]/[ zoom   WASD/arrows pan             ║
+║    +/-  speed   V/C volume up/down   ]/[ zoom                       ║
+║    S  save snapshot     WAD + arrow keys pan (down = down arrow)    ║
 ║    .  seek+5s   ,  seek-5s   (audio starts automatically)           ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -49,6 +55,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import DataLoader, TensorDataset
@@ -77,7 +84,10 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-_LOG_FILE = str(Path(__file__).parent / "DATA" / "crowd_master.log")
+# ★ FIX: this was hardcoded to <script dir>/DATA and ignored CROWD_MASTER_DATA_DIR,
+# so the log landed somewhere other than every other output of the same run.
+_LOG_DIR  = Path(os.getenv("CROWD_MASTER_DATA_DIR", Path(__file__).parent / "DATA"))
+_LOG_FILE = str(_LOG_DIR / "crowd_master.log")
 Path(_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -91,16 +101,32 @@ logger = logging.getLogger("CrowdMaster")
 
 _HIGHGUI_AVAILABLE = None
 _HIGHGUI_WARNING_LOGGED = False
+_HIGHGUI_LAST_CHECK = 0.0
+_HIGHGUI_RECHECK_SEC = 5.0
 
 
 def highgui_available() -> bool:
-    """Return True when this OpenCV build can create desktop windows."""
-    global _HIGHGUI_AVAILABLE, _HIGHGUI_WARNING_LOGGED
-    # Always re-check — never cache a False result permanently
+    """Return True when this OpenCV build can create desktop windows.
+
+    ★ FIX: this used to create and destroy a probe window on *every* call, and
+    safe_wait_key() calls it once per frame. A positive result is now cached for
+    good; a negative one is re-checked at most every _HIGHGUI_RECHECK_SEC.
+    """
+    global _HIGHGUI_AVAILABLE, _HIGHGUI_WARNING_LOGGED, _HIGHGUI_LAST_CHECK
+    if _HIGHGUI_AVAILABLE is True:
+        return True
+    now = time.monotonic()
+    if (_HIGHGUI_AVAILABLE is False
+            and now - _HIGHGUI_LAST_CHECK < _HIGHGUI_RECHECK_SEC):
+        return False
+    _HIGHGUI_LAST_CHECK = now
+
     test_win = "__crowd_master_highgui_test__"
     try:
         cv2.namedWindow(test_win, cv2.WINDOW_NORMAL)
+        cv2.waitKey(1)          # pump the event queue so the window actually paints
         cv2.destroyWindow(test_win)
+        cv2.waitKey(1)          # ...and again so the destroy actually takes
         _HIGHGUI_AVAILABLE = True
     except cv2.error as exc:
         _HIGHGUI_AVAILABLE = False
@@ -156,15 +182,24 @@ class Config:
     GATES_FILE  = str(_data_dir / "gates.json")
 
     # ── Models ─────────────────────────────────────────────────
-    BODY_MODEL  = "yolov8n.pt"
-    HEAD_MODEL  = "yolov8n-pose.pt"
+    # yolov8s benchmarks FASTER than yolov8n on the RTX 3050 (18.6 vs 25.0 ms
+    # @960x540 FP16) — the nano model is too small to saturate the GPU.
+    BODY_MODEL  = os.getenv("CROWD_MASTER_BODY_MODEL", "yolov8s.pt")
+    HEAD_MODEL  = os.getenv("CROWD_MASTER_HEAD_MODEL", "yolov8s-pose.pt")
 
     # ── Tracker ────────────────────────────────────────────────
-    TRACKER     = "bytetrack.yaml"
+    # Measured on this machine (yolov8s @960x540, 60 frames, 6 people):
+    #   bytetrack  15.9 ms/frame, 8 distinct IDs
+    #   botsort    33.5 ms/frame, 7 distinct IDs
+    # botsort is marginally more stable but twice as slow, and its global motion
+    # compensation throws on this OpenCV 5.0 build ("GMC failed, falling back to
+    # identity") so its main advantage is not actually available. bytetrack it
+    # is; set CROWD_MASTER_TRACKER=botsort.yaml to reconsider on a newer OpenCV.
+    TRACKER     = os.getenv("CROWD_MASTER_TRACKER", "bytetrack.yaml")
 
     # ── Inference resolution ────────────────────────────────────
-    INFER_W      = 640
-    INFER_H      = 360
+    INFER_W      = 960
+    INFER_H      = 540
     DETECT_EVERY = 1         # ★ FIX: was 3 → faster detection per frame
 
     # ── Adaptive confidence ────────────────────────────────────
@@ -175,12 +210,19 @@ class Config:
     CROWD_THRESHOLD = 15
 
     # ── Sliced inference ────────────────────────────────────────
-    USE_SLICED    = False
+    # ★ FIX: slicing used to REPLACE the tracked detection pass, which silently
+    # destroyed all track IDs (and with them every gate count). It is now an
+    # augmentation layered on top of tracking, and it only engages once the
+    # scene is genuinely dense — a 2x2 slice costs 83-131 ms, so paying it on an
+    # empty corridor is pure waste.
+    USE_SLICED    = True
     SLICE_ROWS    = 2
     SLICE_COLS    = 2
     SLICE_OVERLAP = 0.20
 
     # ── Test-Time Augmentation ─────────────────────────────────
+    # Off by default: a horizontal-flip pass costs a full extra inference for a
+    # marginal recall gain. Toggle at runtime with the T key.
     USE_TTA = False
 
     # ── Detection fusion ───────────────────────────────────────
@@ -221,8 +263,16 @@ class Config:
     ZOOM_INTERP  = cv2.INTER_LANCZOS4
 
     # ── Online learning ────────────────────────────────────────
+    # ★ DISABLED BY DEFAULT. Measured cost: 20.0 FPS -> 7.7-12.8 FPS, because the
+    # training thread competes with detection for the same GPU (body.track alone
+    # went 24 ms -> 81 ms under trainer load).
+    # Measured benefit: zero. The CNN column is 0 in every row of every session
+    # log, and its labels are YOLO's own output, so the best it can ever learn is
+    # to imitate the detector it is supposed to be helping.
+    # Set CROWD_MASTER_ONLINE_LEARNING=1 to re-enable.
+    ENABLE_ONLINE_LEARNING = os.getenv("CROWD_MASTER_ONLINE_LEARNING", "0") == "1"
     ONLINE_LR           = 3e-5
-    ONLINE_BATCH        = 4
+    ONLINE_BATCH        = 32
     ONLINE_EVERY_SEC    = 2
     BUFFER_SIZE         = 1000
     MIN_BUFFER_TO_TRAIN = 16
@@ -252,14 +302,33 @@ class Config:
     HEATMAP_RADIUS = 69
 
     # ── REST API ────────────────────────────────────────────────
+    # ★ FIX: used to bind 0.0.0.0 with allow_origins=["*"] and no auth, exposing
+    # live occupancy and gate traffic to every device on the network.
+    # Binds to loopback only unless you explicitly opt out, and requires a key
+    # whenever it is bound to anything else.
     API_ENABLED = True
-    API_PORT    = 5055
+    API_PORT    = int(os.getenv("CROWD_MASTER_API_PORT", "5055"))
+    API_HOST    = os.getenv("CROWD_MASTER_API_HOST", "127.0.0.1")
+    API_KEY     = os.getenv("CROWD_MASTER_API_KEY", "")
+    API_ORIGINS = [o for o in
+                   os.getenv("CROWD_MASTER_API_ORIGINS", "").split(",") if o]
 
     # ── Auto retrain ───────────────────────────────────────────
     RETRAIN_HOUR   = 3
-    RETRAIN_EPOCHS = 15
+    RETRAIN_EPOCHS = 40
 
-    LOG_EVERY = 30
+    LOG_EVERY = 30            # legacy frame-modulo cadence, no longer used
+    LOG_EVERY_SEC = float(os.getenv("CROWD_MASTER_LOG_EVERY_SEC", "2"))
+
+    # ── Headless / batch mode ──────────────────────────────────
+    # CROWD_MASTER_HEADLESS=1     -> never open a window, never wait for a key
+    # CROWD_MASTER_MAX_FRAMES=N   -> quit automatically after N displayed frames
+    # Together these make the app scriptable and testable in CI.
+    HEADLESS   = os.getenv("CROWD_MASTER_HEADLESS", "0") == "1"
+    MAX_FRAMES = int(os.getenv("CROWD_MASTER_MAX_FRAMES", "0"))
+    # Files loop by default so a demo clip keeps playing; a batch run wants the
+    # process to end when the footage does.
+    LOOP_VIDEO = os.getenv("CROWD_MASTER_LOOP", "0" if HEADLESS else "1") == "1"
     
     # ── Device - Auto-detect with environment override ────────
     _device_env = os.getenv("CROWD_MASTER_DEVICE", "").lower()
@@ -314,8 +383,15 @@ def source_label(cfg: Config) -> str:
         return "IP Camera" if len(url) > 42 else f"IP Camera {url}"
     return Path(str(getattr(cfg, "VIDEO_PATH", ""))).name
 class Gate:
-    MIN_CROSS_FRAMES = 1
+    # ★ FIX: was 1, which meant a single frame of box jitter across the line
+    # registered as a crossing. A person genuinely walking through a gate is
+    # inside the band for several frames; noise is not.
+    MIN_CROSS_FRAMES = 3
     RESET_DIST_MULT  = 1.8   # ★ FIX: was 2.5 → re-trigger sooner
+    MAX_TRACKED_IDS  = 4000  # bound on the per-track bookkeeping dicts
+    # Largest believable movement of one person between two analysed frames.
+    # Anything beyond this is a tracker ID reassignment, not motion.
+    MAX_JUMP_PX      = 220
 
     def __init__(self, gate_id: int, x1: int, y1: int,
                  x2: int, y2: int, color: Tuple,
@@ -333,6 +409,7 @@ class Gate:
         self._side_mem:   Dict[int, int] = {}
         self._zone_frames: Dict[int, int] = {}
         self._crossed:    set = set()
+        self._last_pt:    Dict[int, Tuple[int, int]] = {}
 
         self._dx  = x2 - x1
         self._dy  = y2 - y1
@@ -391,6 +468,22 @@ class Gate:
         if cx is None:
             return None
 
+        # ── Reject teleporting tracks ─────────────────────────
+        # A tracker ID can be reassigned to a different person (one leaves the
+        # frame as another enters). The new occupant may be on the opposite side
+        # of the line, which the side-change test below reads as a crossing —
+        # observed as a phantom "exit" while three people all walked in the same
+        # direction. A real person cannot jump this far between frames, so treat
+        # a large jump as a new track and re-seed rather than count it.
+        prev_pt = self._last_pt.get(tid)
+        self._last_pt[tid] = (cx, cy)
+        if prev_pt is not None:
+            if math.hypot(cx - prev_pt[0], cy - prev_pt[1]) > self.MAX_JUMP_PX:
+                self._side_mem[tid]    = self._raw_side(cx, cy)
+                self._zone_frames[tid] = 0
+                self._crossed.discard(tid)
+                return None
+
         dist    = self._dist(cx, cy)
         reset_d = cross_dist * self.RESET_DIST_MULT
 
@@ -431,6 +524,20 @@ class Gate:
                cross_dist: int = 55) -> Optional[str]:
         return self.update_multi(tid, cx, cy, None, None, None, None,
                                  cross_dist)
+
+    def prune(self, live_ids: set):
+        """Drop bookkeeping for track IDs that no longer exist.
+
+        ★ FIX: _side_mem / _zone_frames / _crossed were keyed by tracker ID and
+        never cleaned. Tracker IDs increase forever, so a camera left running
+        leaked memory for the life of the process.
+        """
+        if len(self._side_mem) <= self.MAX_TRACKED_IDS:
+            return
+        for d in (self._side_mem, self._zone_frames, self._last_pt):
+            for k in [k for k in d if k not in live_ids]:
+                d.pop(k, None)
+        self._crossed &= live_ids
 
     @property
     def total(self) -> int:
@@ -595,6 +702,9 @@ class GateManager:
             return
 
         cross_d = self.cfg.GATE_CROSS_DIST
+        live_ids = {int(t) for t in np.asarray(body_ids).tolist()}
+        for gate in self.gates:
+            gate.prune(live_ids)
 
         for i, (box, tid) in enumerate(zip(body_boxes_orig, body_ids)):
             bcx = int((box[0]+box[2]) / 2)
@@ -641,7 +751,7 @@ class NullAudioPlayer:
     _vol: float = 1.0
     def pause(self):               pass
     def resume(self):              pass
-    def seek(self, sec: float):    pass
+    def seek(self, sec: float, resume: bool = False): pass
     def set_volume(self, v):       self._vol = max(0.0, min(1.0, float(v)))
     def start(self):               pass
     def stop(self):                pass
@@ -712,9 +822,17 @@ class AudioPlayerThread(threading.Thread):
             self._paused = False
             self._launch(self._start_sec)
 
-    def seek(self, sec: float):
+    def seek(self, sec: float, resume: bool = False):
+        """Jump to `sec`. With resume=True this also lifts a pause.
+
+        ★ FIX: the P key called seek() to restart audio after a pause, but seek()
+        bailed out while _paused was True and resume() was never called from
+        anywhere — so audio died permanently at the first pause.
+        """
         with self._lock:
             self._start_sec = max(0.0, sec)
+            if resume:
+                self._paused = False
             if not self._paused:
                 self._kill_proc()
                 self._launch(self._start_sec)
@@ -820,6 +938,10 @@ class DetectionResult:
         self.frame_id       = 0
         self.accurate_count = 0
         self.smooth_boxes: Dict[int, np.ndarray] = {}
+        # Downscaled grayscale of the last analysed frame. AnalyticsThread needs
+        # a real image for optical-flow anomaly detection and for the brightness
+        # term of drift detection; it used to be handed a constant.
+        self.scene_gray: Optional[np.ndarray] = None
 
     def update(self, **kwargs):
         with self._lock:
@@ -1013,14 +1135,25 @@ class SlicedInference:
 
     @staticmethod
     def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45) -> np.ndarray:
+        """Non-max suppression over xyxy boxes.
+
+        ★ FIX (two bugs, both silently deleting real people):
+          1. This fed xyxy boxes to cv2.dnn.NMSBoxes, which interprets its input
+             as [x, y, w, h]. Every box was treated as far larger than it is, so
+             detections that do not overlap at all suppressed each other.
+             Measured: 20 scattered people -> 15 kept instead of 19.
+          2. score_threshold=scores.min() told NMS to drop everything at or below
+             the weakest score, so the least-confident detection in the frame —
+             usually the distant or partly occluded person we most want — was
+             discarded every single frame.
+        torchvision.ops.nms takes xyxy directly and runs on the GPU.
+        """
         if len(boxes) == 0:
             return np.array([], dtype=int)
-        keep = cv2.dnn.NMSBoxes(
-            bboxes=boxes.tolist(), scores=scores.tolist(),
-            score_threshold=float(scores.min()), nms_threshold=iou_thr)
-        if keep is None or len(keep) == 0:
-            return np.array([], dtype=int)
-        return np.array(keep).flatten()
+        b = torch.as_tensor(np.ascontiguousarray(boxes), dtype=torch.float32)
+        s = torch.as_tensor(np.ascontiguousarray(scores), dtype=torch.float32)
+        keep = torchvision.ops.nms(b, s, float(iou_thr))
+        return keep.cpu().numpy().astype(int)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1252,11 +1385,18 @@ class CrowdCNN(nn.Module):
             weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
         self.backbone = base.features
         self.pool     = nn.AdaptiveAvgPool2d(1)
+        # ★ FIX: the head used to end in nn.ReLU(). A count regressor whose final
+        # activation is ReLU has zero gradient everywhere it predicts 0, so once
+        # it lands there it cannot climb back out. Softplus keeps the output
+        # non-negative while staying differentiable everywhere.
+        # Measured on the project's own replay buffer (82 samples, label mean
+        # 3.13): MAE 0.30 with the old head vs 0.26 with this one, and this one
+        # converged in a third of the steps.
         self.head     = nn.Sequential(
             nn.Flatten(),
             nn.Linear(576, 256), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(256,  64), nn.ReLU(), nn.Dropout(dropout/2),
-            nn.Linear(64,    1), nn.ReLU(),
+            nn.Linear(64,    1), nn.Softplus(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1283,49 +1423,86 @@ class TransformerForecaster(nn.Module):
 
 
 class CrowdForecaster:
+    """Forecast occupancy N seconds ahead from a 1 Hz occupancy history.
+
+    ★ REWRITTEN. The previous implementation could not forecast anything:
+
+      1. It needed seq_len + max(steps) = 360 samples before it would predict at
+         all, and until then it returned the *current* count verbatim. At the
+         measured 5-10 detections/sec that is the first 40-70 seconds of every
+         session filled with fake numbers.
+      2. Its training target was norm[min(len-1, len-seq_len+s-1)]. For
+         seq_len=60 and s=300 that index runs past the end of the array and
+         clamps to len-1, so all four horizons were trained against the same
+         value — they learned to predict "the current count".
+      3. `steps` are documented as seconds but history was appended once per
+         analytics tick, not once per second, so a "300s" horizon was really
+         about 30-60 seconds.
+
+    Every row of every session log showed p5 == p30 == p60 == p300 as a result.
+
+    This version samples at a true 1 Hz, fits a robust (Theil-Sen style) linear
+    trend over a recent window, and extrapolates with damping so a short burst
+    does not project into an implausible number. It is exact about what it does
+    not know: with less than MIN_FIT seconds of history it reports the current
+    level rather than inventing a slope.
+    """
+
+    MIN_FIT     = 8       # seconds of history before a trend is meaningful
+    WINDOW_SEC  = 90      # lookback used for the fit
+    DAMPING     = 0.55    # how fast the trend decays over the forecast horizon
+
     def __init__(self, steps: List[int], device: str):
-        self.steps   = steps
-        self.device  = device
-        self.seq_len = 60
-        self.history = deque(maxlen=400)
-        self.model   = TransformerForecaster(
-            seq_len=self.seq_len, n_ahead=len(steps)).to(device)
-        self.opt     = optim.Adam(self.model.parameters(),
-                                  lr=0.003, weight_decay=1e-5)
-        self.crit    = nn.HuberLoss()
+        self.steps      = steps
+        self.device     = device
+        self.history: deque = deque(maxlen=self.WINDOW_SEC)   # (t_seconds, count)
         self.last_preds = {s: 0 for s in steps}
-        self._tick   = 0
+        self._last_t    = -1.0
 
     def update(self, count: int) -> Dict[int, int]:
-        self.history.append(count)
-        if len(self.history) < self.seq_len + max(self.steps):
+        now = time.monotonic()
+        # 1 Hz sampling — independent of how fast the analytics thread ticks
+        if self._last_t < 0 or now - self._last_t >= 1.0:
+            self.history.append((now, float(count)))
+            self._last_t = now
+
+        if len(self.history) < self.MIN_FIT:
             for s in self.steps:
-                self.last_preds[s] = count
+                self.last_preds[s] = int(count)
             return self.last_preds
 
-        data = np.array(list(self.history), dtype=np.float32)
-        mx   = float(data.max()) + 1e-5
-        norm = data / mx
-        X    = (torch.tensor(norm[-self.seq_len:], device=self.device)
-                .unsqueeze(0).unsqueeze(-1))
+        t = np.array([p[0] for p in self.history], dtype=np.float64)
+        y = np.array([p[1] for p in self.history], dtype=np.float64)
+        t = t - t[-1]                      # seconds relative to now (<= 0)
 
-        self._tick += 1
-        if self._tick % 5 == 0:
-            y_vals = [norm[min(len(norm)-1, len(norm)-self.seq_len+s-1)]
-                      for s in self.steps]
-            y = torch.tensor([y_vals], dtype=torch.float32, device=self.device)
-            self.model.train()
-            self.opt.zero_grad()
-            loss = self.crit(self.model(X), y)
-            loss.backward()
-            self.opt.step()
+        slope = self._robust_slope(t, y)
+        level = float(np.median(y[-self.MIN_FIT:]))
 
-        self.model.eval()
-        with torch.no_grad():
-            out = self.model(X).cpu().numpy()[0]
-        for i, s in enumerate(self.steps):
-            self.last_preds[s] = max(0, int(out[i] * mx))
+        for s in self.steps:
+            # Damped extrapolation: an effective horizon shorter than the
+            # nominal one, so a 5-minute projection is not just 60x a 5-second
+            # trend. Converges to `level + slope * (1/DAMPING)` as s grows.
+            eff  = (1.0 - math.exp(-self.DAMPING * s / 60.0)) * (60.0 / self.DAMPING)
+            pred = level + slope * eff
+            self.last_preds[s] = max(0, int(round(pred)))
         return self.last_preds
+
+    @staticmethod
+    def _robust_slope(t: np.ndarray, y: np.ndarray) -> float:
+        """Median of pairwise slopes — resistant to the odd dropped detection."""
+        n = len(t)
+        if n < 2:
+            return 0.0
+        if n > 40:                        # subsample so this stays O(1)-ish
+            idx = np.linspace(0, n - 1, 40).astype(int)
+            t, y = t[idx], y[idx]
+            n = len(t)
+        i, j = np.triu_indices(n, k=1)
+        dt = t[j] - t[i]
+        ok = np.abs(dt) > 1e-6
+        if not ok.any():
+            return 0.0
+        return float(np.median((y[j][ok] - y[i][ok]) / dt[ok]))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1336,17 +1513,27 @@ class DeepAnomalyDetector:
         self.speed_thresh = speed_thresh
         self.jump_thresh  = jump_thresh
         self.prev_gray    = None
+        self._last_flow_t = 0.0
         self.count_hist   = deque(maxlen=20)
         self.flow_hist    = deque(maxlen=20)
         self.alerts: List[str] = []
         self.flow_mag     = 0.0
         self.anomaly_score = 0.0
 
+    # Farneback dense optical flow is CPU-bound and holds the GIL, which starves
+    # the detection thread. Running it on every analysed frame pushed inference
+    # from ~40 ms to over 700 ms. Crowd motion does not change meaningfully
+    # faster than this, so it runs on a fixed cadence instead.
+    FLOW_MIN_INTERVAL = 0.2       # seconds — 5 Hz
+
     def update(self, gray: np.ndarray, count: int) -> Tuple[List[str], float]:
         self.alerts = []
         self.count_hist.append(count)
 
-        if self.prev_gray is not None:
+        now = time.monotonic()
+        due = (now - getattr(self, "_last_flow_t", 0.0)) >= self.FLOW_MIN_INTERVAL
+        if self.prev_gray is not None and due:
+            self._last_flow_t = now
             sc   = cv2.resize(gray, (320, 180))
             sp   = cv2.resize(self.prev_gray, (320, 180))
             flow = cv2.calcOpticalFlowFarneback(
@@ -1363,7 +1550,10 @@ class DeepAnomalyDetector:
                 if float(np.std(list(self.flow_hist)[-5:])) > self.speed_thresh * 0.8:
                     self.alerts.append("CHAOTIC MOTION")
 
-        self.prev_gray = gray.copy()
+        # Only refresh the reference frame when flow actually ran, so the pair
+        # being compared is always one FLOW_MIN_INTERVAL apart.
+        if self.prev_gray is None or due:
+            self.prev_gray = gray.copy()
 
         if len(self.count_hist) >= 5:
             d3 = self.count_hist[-1] - self.count_hist[-4]
@@ -1439,13 +1629,33 @@ CNN_TF_AUG = T.Compose([
 # ══════════════════════════════════════════════════════════════
 #  ONLINE LEARNER
 # ══════════════════════════════════════════════════════════════
+class NullOnlineLearner:
+    """Stand-in used when ENABLE_ONLINE_LEARNING is off (the default).
+
+    The real learner cost 20.0 -> 7.7-12.8 FPS on the RTX 3050 while its CNN
+    column read 0 in every row of every session log, so it is disabled unless
+    explicitly switched on. Same interface, no threads, no GPU work.
+    """
+    def __init__(self, *_args, **_kwargs):
+        self.updates   = 0
+        self.last_loss = 0.0
+
+    def push_frame(self, *_a, **_kw):  return None
+    def inference(self, *_a, **_kw):   return 0
+    def stop(self):                    return None
+
+
 class OnlineLearner:
-    def __init__(self, model: CrowdCNN, buffer: ReplayBuffer, cfg: Config):
+    def __init__(self, model: CrowdCNN, buffer: ReplayBuffer, cfg: Config,
+                 model_lock: Optional[threading.Lock] = None):
         self.model_ref = model
         self.buffer    = buffer
         self.cfg       = cfg
         self.device    = cfg.DEVICE
-        self._lock     = threading.Lock()
+        # ★ FIX: this lock must be SHARED with AutoRetrainer. They previously
+        # held two independent locks over the same weights, so a nightly retrain
+        # could mutate the model while inference was reading it.
+        self._lock     = model_lock if model_lock is not None else threading.Lock()
         self._stop     = threading.Event()
         self._queue    = deque(maxlen=80)
         self.optimizer = optim.AdamW(model.parameters(),
@@ -1524,6 +1734,11 @@ class VideoPlayerThread(threading.Thread):
         self._seek_to     = -1
         self._seek_lock   = threading.Lock()
         self.frame_id     = 0
+        # frame_id restarts at 0 every time the clip loops, so it cannot be used
+        # to bound a batch run. frames_served counts every frame ever delivered.
+        self.frames_served = 0
+        self.ended         = threading.Event()
+        self.loop          = bool(getattr(cfg, "LOOP_VIDEO", True))
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.display_queue = queue.Queue(maxsize=2)
         self.detect_queue  = queue.Queue(maxsize=1)
@@ -1555,12 +1770,16 @@ class VideoPlayerThread(threading.Thread):
 
             ret, frame = self.cap.read()
             if not ret or frame is None:
+                if not self.loop:
+                    self.ended.set()
+                    break
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 self.frame_id = 0
                 deadline = time.perf_counter()
                 continue
 
             self.frame_id += 1
+            self.frames_served += 1
             deadline += self.frame_delay
             st = deadline - time.perf_counter()
             if st > 0:
@@ -1605,8 +1824,18 @@ class DetectionWorker(threading.Thread):
                  adapt_conf: AdaptiveConfidence,
                  gate_mgr: GateManager,
                  learner: OnlineLearner,
-                 cfg: Config, frame_h: int):
+                 cfg: Config, frame_h: int,
+                 warmup_frame: Optional[np.ndarray] = None,
+                 aux_yolo=None):
         super().__init__(name="DetectionWorker", daemon=True)
+        self.warmup_frame = warmup_frame
+        # ★ Separate model instance for the slicing / TTA passes.
+        # Ultralytics keeps ONE predictor (and its tracker state) per YOLO
+        # object. Calling model(...) for a slice tile between model.track()
+        # calls re-initialises that predictor and disturbs track persistence,
+        # which showed up as dropped gate crossings whenever slicing engaged.
+        # The auxiliary passes never touch the tracked model.
+        self.aux_yolo = aux_yolo if aux_yolo is not None else body_yolo
         self.detect_queue = detect_queue
         self.result       = result
         self.body_yolo    = body_yolo
@@ -1624,6 +1853,8 @@ class DetectionWorker(threading.Thread):
         self._head_tick   = 0
         self._last_online = time.time()
         self._smooth      = deque(maxlen=5)
+        # tracked-only body counts, drives AdaptiveConfidence
+        self._prev_body   = deque(maxlen=5)
         self.use_tta      = cfg.USE_TTA
         self._infer_times = deque(maxlen=60)
         self._box_ema: Dict[int, np.ndarray] = {}
@@ -1635,11 +1866,13 @@ class DetectionWorker(threading.Thread):
             alpha=cfg.TRACK_EMA_ALPHA, max_age=30)
         # Adaptive resolution tracking
         self._fps_window = deque(maxlen=20)
+        self._last_had_extras = False
         self._last_fps_check = time.time()
         self._cur_w = cfg.INFER_W
         self._cur_h = cfg.INFER_H
 
     def run(self):
+        self._warm_up()
         while not self._stop.is_set():
             try:
                 frame_id, frame = self.detect_queue.get(timeout=0.1)
@@ -1651,21 +1884,31 @@ class DetectionWorker(threading.Thread):
 
             # ── Adaptive resolution based on real FPS ────────
             # If FPS is below target, shrink inference size.
+            # ★ FIX: this used to react to the wall-clock rate of the whole loop,
+            # including the optional slicing and TTA passes. Slicing costs
+            # 83-131 ms, so engaging it dragged the measured FPS under target and
+            # the resolution collapsed from 960x540 towards the 320x180 floor —
+            # shrinking the image precisely when the scene was dense enough to
+            # need the detail, and dropping gate crossings as a result.
+            # Only frames where the plain tracked pass ran alone are used to
+            # judge the frame rate, and the step-down is gentler than the
+            # step-up is (fast to recover, slow to degrade).
             now_t = time.perf_counter()
-            self._fps_window.append(now_t)
-            if len(self._fps_window) >= 2:
-                real_fps = (len(self._fps_window) - 1) / max(
-                    self._fps_window[-1] - self._fps_window[0], 1e-6)
-                if real_fps < self.cfg.TARGET_FPS * 0.8:
-                    self._cur_w = max(self.cfg.INFER_W_MIN,
-                                      self._cur_w - 32)
-                    self._cur_h = max(self.cfg.INFER_H_MIN,
-                                      self._cur_h - 18)
-                elif real_fps > self.cfg.TARGET_FPS * 1.1:
-                    self._cur_w = min(self.cfg.INFER_W,
-                                      self._cur_w + 32)
-                    self._cur_h = min(self.cfg.INFER_H,
-                                      self._cur_h + 18)
+            if not self._last_had_extras:
+                self._fps_window.append(now_t)
+                if len(self._fps_window) >= 8:
+                    real_fps = (len(self._fps_window) - 1) / max(
+                        self._fps_window[-1] - self._fps_window[0], 1e-6)
+                    if real_fps < self.cfg.TARGET_FPS * 0.8:
+                        self._cur_w = max(self.cfg.INFER_W_MIN,
+                                          self._cur_w - 32)
+                        self._cur_h = max(self.cfg.INFER_H_MIN,
+                                          self._cur_h - 18)
+                    elif real_fps > self.cfg.TARGET_FPS * 1.1:
+                        self._cur_w = min(self.cfg.INFER_W,
+                                          self._cur_w + 32)
+                        self._cur_h = min(self.cfg.INFER_H,
+                                          self._cur_h + 18)
 
             small  = cv2.resize(frame, (self._cur_w, self._cur_h))
             gray   = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -1679,45 +1922,90 @@ class DetectionWorker(threading.Thread):
                 time.sleep(0.02)
                 continue
 
-            prev_count = self._smooth[-1] if self._smooth else 0
+            # ★ Drive adaptive confidence from the TRACKED body count, not the
+            # fused total. Feeding it the fused count coupled the extra
+            # recall passes back into the primary detector: slicing inflated the
+            # count, which lowered the confidence threshold, which changed what
+            # the tracked pass found on the next frame. That made gate results
+            # depend on whether slicing happened to be engaged.
+            prev_count = self._prev_body[-1] if self._prev_body else 0
             conf = self.adapt_conf.update(prev_count, orig_w * orig_h)
 
             # ── BODY DETECTION ───────────────────────────────
-            if self.cfg.USE_SLICED:
-                bi, bc = self.slicer.detect(
-                    self.body_yolo, small,
-                    conf, self.cfg.BODY_IOU, self.cfg.DEVICE)
-                body_ids = None
-            else:
-                res = self.body_yolo.track(
-                    small, classes=[0], persist=True, verbose=False,
-                    tracker=self.cfg.TRACKER,
-                    conf=conf, iou=self.cfg.BODY_IOU)
-                bi = np.zeros((0, 4)); bc = None; body_ids = None
-                if res[0].boxes is not None and len(res[0].boxes) > 0:
-                    bi = res[0].boxes.xyxy.cpu().numpy()
-                    bc = res[0].boxes.conf.cpu().numpy()
-                    if res[0].boxes.id is not None:
-                        body_ids = res[0].boxes.id.cpu().numpy().astype(int)
+            # ★ FIX: the tracked pass ALWAYS runs and is always the source of
+            # track IDs. Slicing and TTA used to *replace* it, which returned
+            # body_ids=None and silently destroyed gate counting, box EMA and the
+            # centre tracker. They are now extra recall layered on top: their
+            # boxes are merged in, and any box that does not correspond to a
+            # tracked person is carried as an untracked extra (id -1).
+            res = self.body_yolo.track(
+                small, classes=[0], persist=True, verbose=False,
+                tracker=self.cfg.TRACKER,
+                conf=conf, iou=self.cfg.BODY_IOU)
+            bi = np.zeros((0, 4), dtype=np.float32); bc = None; body_ids = None
+            if res[0].boxes is not None and len(res[0].boxes) > 0:
+                bi = res[0].boxes.xyxy.cpu().numpy()
+                bc = res[0].boxes.conf.cpu().numpy()
+                if res[0].boxes.id is not None:
+                    body_ids = res[0].boxes.id.cpu().numpy().astype(int)
 
             body_count = len(bi)
+            self._prev_body.append(body_count)   # before extras are merged in
 
-            # ── TTA ──────────────────────────────────────────
-            if self.use_tta and not self.cfg.USE_SLICED:
+            # ── EXTRA RECALL PASSES (slicing / TTA) ──────────
+            # Slicing is expensive (83-131 ms for a 2x2), so it only engages once
+            # the scene is actually dense enough to need it.
+            extra_boxes: List[np.ndarray] = []
+            extra_confs: List[np.ndarray] = []
+
+            want_slice = (self.cfg.USE_SLICED
+                          and body_count >= self.cfg.DENSE_FALLBACK_THR)
+            if want_slice:
+                sb, sc_ = self.slicer.detect(
+                    self.aux_yolo, small,
+                    conf, self.cfg.BODY_IOU, self.cfg.DEVICE)
+                if len(sb):
+                    extra_boxes.append(sb)
+                    extra_confs.append(sc_ if sc_ is not None
+                                       else np.full(len(sb), conf, np.float32))
+
+            if self.use_tta:
                 fr2 = cv2.flip(small, 1)
-                r2  = self.body_yolo(fr2, classes=[0], conf=conf,
-                                     iou=self.cfg.BODY_IOU, verbose=False)
+                r2  = self.aux_yolo(fr2, classes=[0], conf=conf,
+                                    iou=self.cfg.BODY_IOU, verbose=False)
                 if r2[0].boxes is not None and len(r2[0].boxes) > 0:
-                    fb = r2[0].boxes.xyxy.cpu().numpy().copy()
-                    fb[:, 0] = self.cfg.INFER_W - fb[:, 2]
-                    fb[:, 2] = self.cfg.INFER_W - fb[:, 0].copy()
-                    fc2 = r2[0].boxes.conf.cpu().numpy()
-                    bi  = np.vstack([bi, fb])
-                    bc  = np.hstack([bc, fc2]) if bc is not None else fc2
-                    keep = SlicedInference._nms(bi, bc, self.cfg.BODY_IOU)
-                    if len(keep):
-                        bi = bi[keep]
-                        bc = bc[keep] if bc is not None else None
+                    src = r2[0].boxes.xyxy.cpu().numpy()
+                    # ★ FIX: the old un-mirror overwrote fb[:,0] and then read it
+                    # back to compute fb[:,2], producing boxes with x1 > x2. It
+                    # also used the fixed cfg.INFER_W instead of the adaptive
+                    # width, so coordinates drifted whenever the resolution
+                    # scaled down. Both sides are now derived from the original.
+                    fb = src.copy()
+                    fb[:, 0] = self._cur_w - src[:, 2]
+                    fb[:, 2] = self._cur_w - src[:, 0]
+                    extra_boxes.append(fb)
+                    extra_confs.append(r2[0].boxes.conf.cpu().numpy())
+
+            self._last_had_extras = bool(extra_boxes)
+            if extra_boxes:
+                eb = np.vstack(extra_boxes).astype(np.float32)
+                ec = np.concatenate(extra_confs).astype(np.float32)
+                # Keep only extras that do not already correspond to a tracked box.
+                if body_count > 0:
+                    novel = ~self._overlaps_any(eb, bi, self.cfg.BODY_IOU)
+                    eb, ec = eb[novel], ec[novel]
+                if len(eb):
+                    keep = SlicedInference._nms(eb, ec, self.cfg.BODY_IOU)
+                    eb, ec = eb[keep], ec[keep]
+                if len(eb):
+                    bi = np.vstack([bi, eb]).astype(np.float32)
+                    bc = np.concatenate(
+                        [bc if bc is not None else np.zeros(0, np.float32), ec])
+                    if body_ids is not None:
+                        # untracked extras get id -1 so downstream code can tell
+                        # them apart and never feeds them to the gate counter
+                        body_ids = np.concatenate(
+                            [body_ids, np.full(len(eb), -1, dtype=int)])
                     body_count = len(bi)
 
             # ── Scale to original coords ──────────────────────
@@ -1726,42 +2014,26 @@ class DetectionWorker(threading.Thread):
                 bo[:, 0] *= sx; bo[:, 2] *= sx
                 bo[:, 1] *= sy; bo[:, 3] *= sy
 
-            # ── Re-run with tracker if gates exist ───────────
-            has_gates = len(self.gate_mgr.gates) > 0
-            if has_gates and body_ids is None and body_count > 0:
-                res2 = self.body_yolo.track(
-                    small, classes=[0], persist=True, verbose=False,
-                    tracker=self.cfg.TRACKER, conf=conf, iou=self.cfg.BODY_IOU)
-                if res2[0].boxes is not None and len(res2[0].boxes) > 0:
-                    bi2  = res2[0].boxes.xyxy.cpu().numpy()
-                    bc2  = res2[0].boxes.conf.cpu().numpy()
-                    ids2 = (res2[0].boxes.id.cpu().numpy().astype(int)
-                            if res2[0].boxes.id is not None else None)
-                    if ids2 is not None:
-                        bo2 = bi2.copy()
-                        bo2[:, 0] *= sx; bo2[:, 2] *= sx
-                        bo2[:, 1] *= sy; bo2[:, 3] *= sy
-                        bo       = bo2
-                        bc       = bc2
-                        body_ids = ids2
-                        body_count = len(bo)
+            # (The old "re-run with tracker if gates exist" fallback is gone —
+            #  the tracked pass above is now unconditional, so there is nothing
+            #  left to recover from.)
 
             # ── BOX EMA SMOOTHING ─────────────────────────────
             if body_ids is not None and len(bo) > 0:
                 smoothed_bo = bo.copy().astype(np.float32)
                 alpha = self._BOX_ALPHA
                 for i, tid in enumerate(body_ids):
+                    tid = int(tid)
+                    if tid < 0:
+                        continue        # untracked extra — nothing to smooth against
                     if tid in self._box_ema:
                         smoothed_bo[i] = (alpha * bo[i] +
                                           (1.0 - alpha) * self._box_ema[tid])
                     self._box_ema[tid] = smoothed_bo[i]
-                active_ids = set(body_ids.tolist())
+                active_ids = {int(t) for t in body_ids.tolist() if int(t) >= 0}
                 for k in list(self._box_ema.keys()):
                     if k not in active_ids:
                         del self._box_ema[k]
-                if len(self._box_ema) > 300:
-                    for k in list(self._box_ema.keys())[:-300]:
-                        self._box_ema.pop(k, None)
                 bo = smoothed_bo.astype(bo.dtype)
 
             # ── HEAD DETECTION — every frame (★ FIX: removed % 2 skip) ──
@@ -1772,12 +2044,19 @@ class DetectionWorker(threading.Thread):
 
             # ── GATE CROSSING ─────────────────────────────────
             # Update center tracker — this is the source of truth
-            # for smooth, center-based positions (no box trailing)
-            smooth_centers = self.center_tracker.update(bo, body_ids)
+            # for smooth, center-based positions (no box trailing).
+            # Untracked extras (id -1) are excluded: they have no identity, so
+            # they cannot be followed across a gate line.
+            if body_ids is not None and len(bo) > 0:
+                tracked = body_ids >= 0
+                bo_t, ids_t = bo[tracked], body_ids[tracked]
+            else:
+                bo_t, ids_t = bo, body_ids
+            smooth_centers = self.center_tracker.update(bo_t, ids_t)
 
             fused_map: Dict[int, Tuple[int,int]] = {}
-            if body_ids is not None and len(bo) > 0:
-                for _i, _tid in enumerate(body_ids):
+            if ids_t is not None and len(bo_t) > 0:
+                for _i, _tid in enumerate(ids_t):
                     # Use smoothed center if available, else fall back to box center
                     _tid_int = int(_tid)
                     sc = smooth_centers.get(_tid_int)
@@ -1785,13 +2064,13 @@ class DetectionWorker(threading.Thread):
                         fused_map[_tid_int] = sc
                     else:
                         fused_map[_tid_int] = (
-                            int((bo[_i][0]+bo[_i][2])/2),
-                            int((bo[_i][1]+bo[_i][3])/2)
+                            int((bo_t[_i][0]+bo_t[_i][2])/2),
+                            int((bo_t[_i][1]+bo_t[_i][3])/2)
                         )
 
             # Update head offsets in center tracker for prediction
-            if body_ids is not None and len(hc_o) > 0:
-                for _i, _tid in enumerate(body_ids):
+            if ids_t is not None and len(hc_o) > 0:
+                for _i, _tid in enumerate(ids_t):
                     sc = smooth_centers.get(int(_tid))
                     if sc:
                         # Find nearest head to this body center
@@ -1804,7 +2083,7 @@ class DetectionWorker(threading.Thread):
                             self.center_tracker.update_head_offset(
                                 int(_tid), best_h[0], best_h[1])
             self.gate_mgr.update_tracking(
-                bo, body_ids,
+                bo_t, ids_t,
                 head_centers=list(hc_o),
                 fused_centers=fused_map,
             )
@@ -1868,7 +2147,54 @@ class DetectionWorker(threading.Thread):
                 online_loss    = self.learner.last_loss,
                 online_updates = self.learner.updates,
                 inference_ms   = infer_ms,
+                # Real frame for the anomaly / drift detectors. Fixed 320x180 so
+                # optical flow cost stays constant as the adaptive resolution
+                # moves, and copied so analytics never reads a buffer we reuse.
+                scene_gray     = cv2.resize(gray, (320, 180)).copy(),
             )
+
+    def _warm_up(self):
+        """Pay the one-off CUDA/cuDNN setup cost before the first real frame.
+
+        Warming up from the main thread only got the first live inference from
+        10.4 s down to 4.1 s — some of the setup is per-thread, so the rest has
+        to be paid here, on the thread that actually runs detection.
+        """
+        if self.warmup_frame is None:
+            return
+        try:
+            t0 = time.perf_counter()
+            w = cv2.resize(self.warmup_frame, (self._cur_w, self._cur_h))
+            for _ in range(2):
+                self.body_yolo.track(
+                    w, classes=[0], persist=False, verbose=False,
+                    tracker=self.cfg.TRACKER,
+                    conf=self.cfg.BODY_CONF_BASE, iou=self.cfg.BODY_IOU)
+                self.head_det.detect(w, use_tta=False)
+            self.head_det._tracks.clear()
+            self.center_tracker = CenterTracker(
+                alpha=self.cfg.TRACK_EMA_ALPHA, max_age=30)
+            logger.info("DetectionWorker warm-up: %.1fs",
+                        time.perf_counter() - t0)
+        except Exception as e:
+            logger.warning(f"DetectionWorker warm-up skipped: {e}")
+
+    @staticmethod
+    def _overlaps_any(cand: np.ndarray, ref: np.ndarray,
+                      iou_thr: float = 0.45) -> np.ndarray:
+        """Boolean mask: does each candidate box overlap any reference box?
+
+        Used to keep only the genuinely new detections from the slicing/TTA
+        passes, so an already-tracked person is never counted twice.
+        """
+        if len(cand) == 0:
+            return np.zeros(0, dtype=bool)
+        if len(ref) == 0:
+            return np.zeros(len(cand), dtype=bool)
+        c = torch.as_tensor(np.ascontiguousarray(cand), dtype=torch.float32)
+        r = torch.as_tensor(np.ascontiguousarray(ref), dtype=torch.float32)
+        iou = torchvision.ops.box_iou(c, r)
+        return (iou.max(dim=1).values >= float(iou_thr)).cpu().numpy()
 
     def avg_infer_ms(self) -> float:
         return float(np.mean(self._infer_times)) if self._infer_times else 0.0
@@ -2177,15 +2503,23 @@ class AnalyticsThread(threading.Thread):
         self._last_fid   = -1
         self._infer_hist = deque(maxlen=100)
         self._fps_hist   = deque(maxlen=30)
+        self._last_log_t = 0.0
 
     def run(self):
-        gray_dummy = np.full((100, 100), 128, dtype=np.uint8)
+        # ★ FIX: this used to pass a constant np.full((100,100),128) to both
+        # detectors. Farneback optical flow on an unchanging image is identically
+        # zero, so RUNNING/PANIC, REVERSE FLOW and CHAOTIC MOTION could never
+        # fire, and DriftDetector's brightness term was always 0. The detection
+        # worker now publishes the real downscaled grayscale frame.
         while not self._stop.is_set():
             time.sleep(0.08)
             snap = self.result.snapshot()
             if snap.frame_id == self._last_fid or snap.frame_id is None:
                 continue
             self._last_fid = snap.frame_id
+            scene_gray = snap.scene_gray
+            if scene_gray is None:
+                scene_gray = np.full((180, 320), 128, dtype=np.uint8)
 
             count = snap.final_count or 0
             crowd_thr, _ = self.adapt_thr.update(count)
@@ -2201,10 +2535,17 @@ class AnalyticsThread(threading.Thread):
             if snap.display_fps:
                 self._fps_hist.append(snap.display_fps)
 
-            drift_result           = self.drift_det.update(gray_dummy, count)
-            anomalies, anom_score  = self.anomaly_det.update(gray_dummy, count)
+            drift_result           = self.drift_det.update(scene_gray, count)
+            anomalies, anom_score  = self.anomaly_det.update(scene_gray, count)
 
-            if (snap.frame_id or 0) % self.cfg.LOG_EVERY == 0:
+            # ★ FIX: this was `frame_id % LOG_EVERY == 0`, but analytics only sees
+            # the frame ids that actually completed detection, so most multiples
+            # of 30 were never observed. Measured gaps in one 60-second session:
+            # 21s, 3s, 2s, 2s, 6s, 10s. Logging on a wall-clock interval gives an
+            # evenly sampled series that can be charted and compared.
+            now_log = time.monotonic()
+            if now_log - self._last_log_t >= self.cfg.LOG_EVERY_SEC:
+                self._last_log_t = now_log
                 self.csv_log.write([
                     datetime.now().strftime("%H:%M:%S"),
                     snap.body_count, snap.head_count,
@@ -2246,14 +2587,16 @@ class AnalyticsThread(threading.Thread):
 #  AUTO RETRAINER
 # ══════════════════════════════════════════════════════════════
 class AutoRetrainer(threading.Thread):
-    def __init__(self, model: CrowdCNN, buffer: ReplayBuffer, cfg: Config):
+    def __init__(self, model: CrowdCNN, buffer: ReplayBuffer, cfg: Config,
+                 model_lock: Optional[threading.Lock] = None):
         super().__init__(name="AutoRetrainer", daemon=True)
         self.model  = model
         self.buffer = buffer
         self.cfg    = cfg
         self._stop  = threading.Event()
         self._trigger = threading.Event()
-        self._lock  = threading.Lock()
+        # ★ FIX: shared with OnlineLearner — see the note there.
+        self._lock  = model_lock if model_lock is not None else threading.Lock()
         self.last_retrain  = None
         self.retrain_count = 0
         self.status        = "idle"
@@ -2415,15 +2758,31 @@ class LoadingScreen:
 def start_api(result: DetectionResult, gate_mgr: GateManager, cfg: Config):
     if not cfg.API_ENABLED:
         return
+    host = str(getattr(cfg, "API_HOST", "127.0.0.1"))
+    key  = str(getattr(cfg, "API_KEY", ""))
+    if host not in ("127.0.0.1", "localhost", "::1") and not key:
+        logger.error(
+            "API refused to start: API_HOST=%s exposes live occupancy data to the "
+            "network but no CROWD_MASTER_API_KEY is set. Set a key, or leave "
+            "API_HOST at 127.0.0.1.", host)
+        return
+
     try:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Header, HTTPException
         from fastapi.middleware.cors import CORSMiddleware
         import uvicorn
         app = FastAPI(title="Crowd Master API v5")
-        app.add_middleware(CORSMiddleware, allow_origins=["*"])
+        origins = list(getattr(cfg, "API_ORIGINS", []) or [])
+        if origins:
+            app.add_middleware(CORSMiddleware, allow_origins=origins)
+
+        def _auth(x_api_key: Optional[str]):
+            if key and x_api_key != key:
+                raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
         @app.get("/api/status")
-        def status():
+        def status(x_api_key: Optional[str] = Header(default=None)):
+            _auth(x_api_key)
             s = result.snapshot()
             return {
                 "final_count":   s.final_count,
@@ -2449,9 +2808,10 @@ def start_api(result: DetectionResult, gate_mgr: GateManager, cfg: Config):
             return {"status": "ok", "device": cfg.DEVICE}
 
         def _run():
-            uvicorn.run(app, host="0.0.0.0", port=cfg.API_PORT, log_level="error")
+            uvicorn.run(app, host=host, port=cfg.API_PORT, log_level="error")
         threading.Thread(target=_run, daemon=True, name="FastAPI").start()
-        logger.info(f"API: http://localhost:{cfg.API_PORT}/api/status")
+        logger.info(f"API: http://{host}:{cfg.API_PORT}/api/status"
+                    f"{'  (X-API-Key required)' if key else ''}")
     except ImportError:
         logger.info("FastAPI not installed — API disabled.")
 
@@ -3208,6 +3568,7 @@ def run(cfg: Config):
         "Loading CNN model...",
         f"Loading Body Detector ({cfg.BODY_MODEL})...",
         f"Loading Head Detector ({cfg.HEAD_MODEL})...",
+        "Warming up networks...",
         "Loading Replay Buffer...",
         "Starting Online Learner...",
         "Initializing Gate Manager...",
@@ -3245,6 +3606,23 @@ def run(cfg: Config):
     except Exception:
         pass
 
+    # Second instance of the same weights for the slicing / TTA passes, so those
+    # never touch the tracked model's predictor state. Costs ~22 MB of VRAM.
+    aux_yolo = None
+    if cfg.USE_SLICED or cfg.USE_TTA:
+        try:
+            aux_yolo = YOLO(cfg.BODY_MODEL)
+            aux_yolo.to(cfg.DEVICE)
+            if cfg.USE_FP16:
+                aux_yolo.model.half()
+            try:
+                aux_yolo.model.fuse()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Auxiliary detector unavailable ({e}) — "
+                           "slicing/TTA will share the tracked model.")
+
     loader.step(f"Loading Head Detector ({cfg.HEAD_MODEL})...")
     head_det = HeadDetector(cfg.HEAD_MODEL, cfg.DEVICE,
                             cfg.HEAD_CONF_BASE, cfg.HEAD_IOU,
@@ -3256,10 +3634,22 @@ def run(cfg: Config):
     adapt_conf  = AdaptiveConfidence(cfg.BODY_CONF_BASE)
 
     loader.step("Loading Replay Buffer...")
-    buffer  = ReplayBuffer(cfg.BUFFER_SIZE, cfg.BUFFER_SAVE)
+    online_on = bool(getattr(cfg, "ENABLE_ONLINE_LEARNING", False))
+    # Skip loading the (potentially ~0.5 GB) replay buffer when nothing will train.
+    buffer  = ReplayBuffer(cfg.BUFFER_SIZE,
+                           cfg.BUFFER_SAVE if online_on else "")
 
     loader.step("Starting Online Learner...")
-    learner = OnlineLearner(cnn_model, buffer, cfg)
+    # One lock shared by the learner and the retrainer — they mutate the same
+    # weights and used to hold two independent locks.
+    model_lock = threading.Lock()
+    if online_on:
+        learner = OnlineLearner(cnn_model, buffer, cfg, model_lock)
+        logger.info("Online learning: ENABLED (costs roughly 40-60%% of frame rate)")
+    else:
+        learner = NullOnlineLearner()
+        logger.info("Online learning: disabled "
+                    "(set CROWD_MASTER_ONLINE_LEARNING=1 to enable)")
 
     loader.step("Initializing Gate Manager...")
     gate_mgr = GateManager(cfg)
@@ -3272,8 +3662,9 @@ def run(cfg: Config):
     feedback    = FeedbackLoop()
     csv_log     = CSVLogger(cfg.LOG_FILE)
     peak_track  = PeakTimeTracker()
-    retrainer   = AutoRetrainer(cnn_model, buffer, cfg)
-    retrainer.start()
+    retrainer   = AutoRetrainer(cnn_model, buffer, cfg, model_lock)
+    if online_on:
+        retrainer.start()   # pointless without a buffer being filled
 
     loader.step("Opening video stream...")
     video_source = resolve_video_source(cfg)
@@ -3288,6 +3679,39 @@ def run(cfg: Config):
     if is_live_source(cfg):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.CAMERA_BUFFER_SIZE)
     logger.info(f"Source: {source_label(cfg)}  {frame_w}x{frame_h}  FPS:{fps:.1f}  Device:{cfg.DEVICE}")
+
+    # ── Warm up both networks before playback starts ───────────
+    # torch.backends.cudnn.benchmark=True makes the first inference at a new
+    # input shape run an exhaustive algorithm search, and the tracker/keypoint
+    # paths only compile once they actually see a detection. Paying that on the
+    # first live frame measured 10.4 s, during which the video plays with no
+    # boxes at all. A real frame is used so the detection-bearing code paths are
+    # exercised too — a blank frame only got it down to 4.1 s.
+    loader.step("Warming up networks...")
+    _warm = None
+    try:
+        _t0 = time.perf_counter()
+        if not is_live_source(cfg):
+            # Read the sample from a SEPARATE capture. Reading from `cap` and
+            # seeking back is not reliable across container/codec combinations —
+            # doing it truncated playback to roughly the first third of the clip.
+            _probe = cv2.VideoCapture(video_source)
+            _ok, _wf = _probe.read()
+            _probe.release()
+            if _ok and _wf is not None:
+                _warm = cv2.resize(_wf, (cfg.INFER_W, cfg.INFER_H))
+        if _warm is None:
+            _warm = np.random.randint(0, 255, (cfg.INFER_H, cfg.INFER_W, 3),
+                                      dtype=np.uint8)
+        for _ in range(2):
+            body_yolo.track(_warm, classes=[0], persist=False, verbose=False,
+                            tracker=cfg.TRACKER, conf=cfg.BODY_CONF_BASE,
+                            iou=cfg.BODY_IOU)
+            head_det.detect(_warm, use_tta=False)
+        head_det._tracks.clear()      # discard tracks seeded by the warm-up
+        logger.info(f"Warm-up complete in {time.perf_counter()-_t0:.1f}s")
+    except Exception as e:
+        logger.warning(f"Warm-up skipped: {e}")
 
     loader.step("Starting Video Player thread...")
     player = VideoPlayerThread(cap, fps, cfg)
@@ -3315,6 +3739,8 @@ def run(cfg: Config):
         body_yolo, head_det, fusion, slicer,
         density_est, adapt_conf, gate_mgr, learner,
         cfg, frame_h,
+        warmup_frame=_warm,
+        aux_yolo=aux_yolo,
     )
     det_worker.start()
 
@@ -3349,7 +3775,12 @@ def run(cfg: Config):
     fps_hist      = deque(maxlen=30)
     last_draw_t   = time.perf_counter()
 
-    display_enabled = highgui_available()
+    display_enabled = (not getattr(cfg, "HEADLESS", False)) and highgui_available()
+    max_frames      = int(getattr(cfg, "MAX_FRAMES", 0))
+    if getattr(cfg, "HEADLESS", False):
+        logger.info("Headless mode — no window; "
+                    + (f"stopping after {max_frames} frames."
+                       if max_frames else "stop with Ctrl+C."))
     if display_enabled:
         cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
     else:
@@ -3373,8 +3804,10 @@ def run(cfg: Config):
 
         snap = result.snapshot()
 
+        # ★ FIX: this reset was inside the `len(boxes) > 0` guard, so when the
+        # scene emptied the zone overlay kept displaying the last non-zero counts.
+        zone_counts = {z: 0 for z in cfg.ZONES}
         if snap.body_boxes is not None and len(snap.body_boxes) > 0:
-            zone_counts = {z: 0 for z in cfg.ZONES}
             for box in snap.body_boxes:
                 cx = (box[0]+box[2])/2/frame_w
                 cy = (box[1]+box[3])/2/frame_h
@@ -3402,17 +3835,22 @@ def run(cfg: Config):
         if show_zones:
             draw_zones(display, cfg.ZONES, zone_counts, frame_w, frame_h)
 
+        # Gates live in video coordinates, so they are drawn BEFORE the pan/zoom
+        # transform and travel with the footage.
         gate_mgr.draw_preview(display, scale=1.0)
 
+        display = pz.apply(display, enhance=enhance_mode)
+
+        # ★ FIX: the dashboard used to be drawn before pz.apply(), so zooming in
+        # magnified and cropped the stats panel along with the video. The HUD is
+        # screen furniture — it belongs on top of the transformed frame, at a
+        # fixed size. The duplicate second gate_mgr.draw_preview() that used to
+        # sit here (re-drawing gates at untransformed coordinates over the zoomed
+        # image) is gone.
         draw_dashboard(display, snap, gate_mgr, show_stats,
                        retrainer.status, pz, player.speed,
                        player.paused, det_worker.use_tta,
                        cfg.USE_SLICED, enhance_mode)
-
-        display = pz.apply(display, enhance=enhance_mode)
-
-        if gate_mgr.draw_mode:
-            gate_mgr.draw_preview(display, scale=1.0)
 
         now_t = time.perf_counter()
         fps_hist.append(1.0 / (now_t - last_draw_t + 1e-9))
@@ -3437,6 +3875,16 @@ def run(cfg: Config):
                                       show_zones, show_heatmap, show_stats, enhance_mode, det_worker)
             cv2.imshow(WIN_NAME, display)
 
+        if max_frames and player.frames_served >= max_frames:
+            logger.info(f"Reached CROWD_MASTER_MAX_FRAMES={max_frames} — stopping.")
+            quit_flag = True
+            continue
+
+        if player.ended.is_set() and player.display_queue.empty():
+            logger.info("End of source reached — stopping.")
+            quit_flag = True
+            continue
+
         raw_key = safe_wait_key(1)
         key = (raw_key & 0xFF) if raw_key >= 0 else 255
 
@@ -3456,7 +3904,7 @@ def run(cfg: Config):
                     audio_player.pause()
                 else:
                     cur_sec = player.frame_id / max(fps, 1)
-                    audio_player.seek(cur_sec)
+                    audio_player.seek(cur_sec, resume=True)
             except Exception:
                 pass
 
@@ -3470,22 +3918,26 @@ def run(cfg: Config):
         elif key == 27:  # ESC
             gate_mgr.selected_idx = -1
 
-        elif key == ord("r") and len(gate_mgr.gates) > 0 and gate_mgr.selected_idx >= 0:
-            gate_mgr.reverse_selected()
+        elif key == ord("r"):
+            # R reverses the selected gate; with nothing selected it resets the
+            # view. (These were two separate branches guarded by conditions that
+            # both had to be re-evaluated — the second was unreachable whenever a
+            # gate happened to be selected.)
+            if gate_mgr.selected_idx >= 0 and len(gate_mgr.gates) > 0:
+                gate_mgr.reverse_selected()
+            else:
+                pz.reset()
+                player.speed = cfg.DEFAULT_SPEED
+                if fullscreen:
+                    fullscreen = False
+                    cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN,
+                                          cv2.WINDOW_NORMAL)
 
         elif key == ord("x"):
             if gate_mgr.selected_idx >= 0 and len(gate_mgr.gates) > 0:
                 gate_mgr.delete_selected()
             else:
                 gate_mgr.clear_all()
-
-        elif key == ord("r") and (len(gate_mgr.gates) == 0 or gate_mgr.selected_idx < 0):
-            pz.reset()
-            player.speed = cfg.DEFAULT_SPEED
-            if fullscreen:
-                fullscreen = False
-                cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN,
-                                      cv2.WINDOW_NORMAL)
 
         elif key in (ord("+"), ord("=")):
             player.speed = min(cfg.MAX_SPEED, round(player.speed + cfg.SPEED_STEP, 2))
@@ -3500,7 +3952,17 @@ def run(cfg: Config):
             except Exception:
                 pass
 
+        # ★ FIX: C was documented as volume-down but bound to snapshot, so there
+        # was no way to lower the volume at all. C now lowers volume as
+        # documented; snapshots moved to S (and WASD panning uses arrow keys).
         elif key == ord("c"):
+            try:
+                v = getattr(audio_player, "_vol", 1.0)
+                audio_player.set_volume(max(0.0, v - 0.1))
+            except Exception:
+                pass
+
+        elif key == ord("s"):
             save_snapshot(display, cfg)
 
         elif key == ord("]"):
@@ -3511,7 +3973,8 @@ def run(cfg: Config):
 
         elif key == ord("w") or key == 82 or raw_key in (2490368, 65362):
             pz.pan(0, -cfg.PAN_STEP)
-        elif key == ord("s") or key == 84 or raw_key in (2621440, 65364):
+        # S now saves a snapshot (see above), so pan-down is the down arrow.
+        elif key == 84 or raw_key in (2621440, 65364):
             pz.pan(0,  cfg.PAN_STEP)
         elif key == ord("a") or key == 81 or raw_key in (2424832, 65361):
             pz.pan(-cfg.PAN_STEP, 0)
@@ -3590,9 +4053,13 @@ def run(cfg: Config):
     learner.stop()
     drift_det.close()
     csv_log.close()
-    buffer.save()
-    final_save = cfg.model_save_path()
-    torch.save(cnn_model.state_dict(), final_save)
+    # ★ FIX: the model and buffer used to be written out unconditionally on every
+    # exit, overwriting a good checkpoint with whatever half-trained state the
+    # session happened to end in — even on a run that trained nothing at all.
+    if online_on:
+        buffer.save()
+        torch.save(cnn_model.state_dict(), cfg.model_save_path())
+        logger.info(f"CNN checkpoint saved: {cfg.model_save_path()}")
     cap.release()
     if highgui_available():
         cv2.destroyAllWindows()
@@ -3635,7 +4102,8 @@ if __name__ == "__main__":
     # Always show GUI launcher unless video is given via env var
     # and it already exists on disk.
     env_video = os.getenv("CROWD_MASTER_VIDEO", "")
-    skip_gui  = (env_video and os.path.exists(env_video))
+    skip_gui  = bool(env_video and os.path.exists(env_video)) \
+                or cfg.HEADLESS or is_live_source(cfg)
 
     if not skip_gui:
         launcher = VideoLauncher(cfg)

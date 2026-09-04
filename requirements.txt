@@ -1,0 +1,29 @@
+# Crowd Master — pinned to the versions this build is verified against
+# (RTX 3050 Laptop, CUDA 13.0, Python 3.13, Windows 11)
+#
+# PyTorch is NOT installed from PyPI for CUDA builds. Install it first:
+#
+#   pip install torch==2.11.0 torchvision==0.26.0 \
+#       --index-url https://download.pytorch.org/whl/cu130
+#
+# then:  pip install -r requirements.txt
+#
+# For a CPU-only machine, drop the --index-url and set CROWD_MASTER_DEVICE=cpu.
+
+ultralytics==8.4.99
+opencv-python==5.0.0.93      # NOT opencv-python-headless — the UI needs HighGUI
+numpy==2.5.1
+pillow==12.3.0
+
+# REST API
+fastapi==0.139.2
+uvicorn==0.51.0
+
+# Session reports
+matplotlib==3.11.0
+reportlab==5.0.0
+
+# --- Optional ---------------------------------------------------------------
+# onnx + onnxruntime   enable the E key (ONNX export of the CNN regressor)
+# ffmpeg on PATH       enables audio playback (the app looks for ffplay)
+#                      winget install ffmpeg
