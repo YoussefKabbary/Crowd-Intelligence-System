@@ -212,6 +212,9 @@ class Config:
     CAMERA_URL   = os.getenv("CROWD_MASTER_CAMERA_URL", "")
     CAMERA_BUFFER_SIZE = 1
     SHOW_CONTROLS = True
+    # Seconds the controls panel stays up before fading out on its own.
+    # Press K to pin it open (or closed). 0 disables auto-hide.
+    CONTROLS_AUTOHIDE_SEC = float(os.getenv("CROWD_MASTER_CONTROLS_SEC", "12"))
     
     LOG_FILE    = str(_data_dir / "crowd_log.csv")
     REPORT_FILE = str(_data_dir / "crowd_report.txt")
@@ -2929,12 +2932,10 @@ def draw_dashboard(frame: np.ndarray,
                    enhance_mode: bool = False):
     h, w = frame.shape[:2]
 
-    hint1 = "Q quit  P pause  +/- speed  V/C volume  ]/[ zoom  WASD/arrows pan  . +5s  , -5s"
-    hint2 = "N stats  B boxes  H heads  Z zones  M heatmap  G gate  TAB select  R reverse  ESC desel  X del  I enhance  T TTA  F full"
-    cv2.putText(frame, hint1, (10,h-26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100,100,100), 1, cv2.LINE_AA)
-    cv2.putText(frame, hint2, (10,h-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100,100,100), 1, cv2.LINE_AA)
+    # ★ Two permanent key-hint lines used to be painted along the bottom edge at
+    # 0.32 scale in dark grey. On anything narrower than about 1400 px they ran
+    # off the frame and overlapped each other into an unreadable smear, and they
+    # duplicated the controls panel (K) which now shows the same keys legibly.
 
     hud = (f"{'[||] ' if paused else ''}"
            f"Spd:{speed:.1f}x  Zm:{pz.zoom:.1f}x"
@@ -3317,62 +3318,59 @@ def draw_controls_overlay(frame: np.ndarray, cfg: Config, player, gate_mgr: Gate
                           show_boxes: bool, show_heads: bool, show_zones: bool,
                           show_heatmap: bool, show_stats: bool, enhance_mode: bool,
                           det_worker) -> None:
+    # ★ REWRITTEN. The old panel was a fixed 520x315 box pinned to the top-left.
+    # On a 640x360 clip that is 81% of the width and 87% of the height — it
+    # buried both the video and the stats dashboard, which is also top-left.
+    # It is now sized relative to the frame, anchored bottom-right away from the
+    # dashboard, and its key list matches the actual bindings (snapshot moved
+    # from C to S when C became volume-down).
     h, w = frame.shape[:2]
-    panel_w = min(520, max(360, w - 40))
-    panel_h = 315
-    x1, y1 = 18, 48
-    x2, y2 = x1 + panel_w, min(y1 + panel_h, h - 18)
+    s = max(0.62, min(1.15, w / 1280.0))          # scale with the video
+    fs_title, fs_key, fs_dot = 0.46 * s, 0.38 * s, 0.34 * s
+    line_h  = int(17 * s)
+    pad     = int(12 * s)
+
+    left = ["Q quit", "P pause", "S snapshot", "+/- speed",
+            "[ ] zoom", "WAD/arrows pan", "R reset view"]
+    right = ["B boxes", "H heads", "N stats", "Z zones",
+             "M heatmap", "G gate draw", "O detect on/off"]
+
+    col_w   = int(140 * s)
+    panel_w = min(int(col_w * 2 + pad * 3), int(w * 0.62))
+    panel_h = min(int(pad * 2 + line_h * (len(left) + 3)), int(h * 0.72))
+    x2, y2  = w - int(14 * s), h - int(14 * s)
+    x1, y1  = x2 - panel_w, y2 - panel_h
+
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 24, 32), -1)
-    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (78, 204, 163), 2)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (78, 204, 163), 1, cv2.LINE_AA)
 
-    def put(text_value, x, y, color=(235, 235, 235), scale=0.47, thick=1):
+    def put(text_value, x, y, color=(235, 235, 235), scale=fs_key, thick=1):
         cv2.putText(frame, text_value, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                     scale, color, thick, cv2.LINE_AA)
 
-    put("CONTROLS  (K hide/show)", x1 + 16, y1 + 28, (78, 204, 163), 0.58, 2)
-    status = [
-        f"Source: {source_label(cfg)}",
-        f"Speed: {player.speed:.2f}x",
-        f"Detection: {'ON' if getattr(det_worker, 'detection_enabled', True) else 'OFF'}",
-        f"Gates: {len(gate_mgr.gates)}   In:{gate_mgr.total_entry} Out:{gate_mgr.total_exit}",
-    ]
-    yy = y1 + 58
-    for line in status:
-        put(line, x1 + 16, yy, (210, 220, 230), 0.45)
-        yy += 21
-
-    left = [
-        "Q quit", "P pause/resume", "C snapshot", "+/- speed",
-        "[/] zoom", "WASD / arrows pan", "R reset view", "K controls"
-    ]
-    right = [
-        "B boxes", "H heads", "N stats", "Z zones", "M heatmap",
-        "I enhance", "T TTA", "O detection on/off"
-    ]
-    yy = y1 + 155
-    put("Playback", x1 + 16, yy, (255, 210, 120), 0.48, 2)
-    put("AI / View", x1 + panel_w//2, yy, (255, 210, 120), 0.48, 2)
-    yy += 24
+    yy = y1 + pad + int(12 * s)
+    put("CONTROLS   K hide", x1 + pad, yy, (78, 204, 163), fs_title, 1)
+    yy += line_h + int(3 * s)
     for i in range(max(len(left), len(right))):
         if i < len(left):
-            put(left[i], x1 + 20, yy, (235, 235, 235), 0.43)
+            put(left[i],  x1 + pad, yy)
         if i < len(right):
-            put(right[i], x1 + panel_w//2, yy, (235, 235, 235), 0.43)
-        yy += 21
+            put(right[i], x1 + pad + col_w, yy)
+        yy += line_h
 
-    flags = [
-        ("Boxes", show_boxes), ("Heads", show_heads), ("Stats", show_stats),
-        ("Zones", show_zones), ("Heat", show_heatmap), ("Enhance", enhance_mode),
-    ]
-    bx = x1 + 16
-    by = y2 - 22
+    # Active-toggle dots along the bottom edge of the panel.
+    flags = [("Box", show_boxes), ("Head", show_heads), ("Stat", show_stats),
+             ("Zone", show_zones), ("Heat", show_heatmap), ("Enh", enhance_mode)]
+    bx = x1 + pad
+    by = y2 - int(9 * s)
+    step = (panel_w - pad * 2) // len(flags)
     for name, enabled in flags:
         col = (78, 204, 163) if enabled else (95, 95, 105)
-        cv2.circle(frame, (bx, by - 4), 5, col, -1)
-        put(name, bx + 10, by, (220, 220, 220), 0.38)
-        bx += 78
+        cv2.circle(frame, (bx, by - int(4 * s)), max(2, int(3 * s)), col, -1)
+        put(name, bx + int(8 * s), by, (200, 200, 205), fs_dot)
+        bx += step
 class VideoLauncher:
     """
     Shows a clean Tkinter window with:
@@ -3807,6 +3805,10 @@ def run(cfg: Config):
     show_heads    = True
     show_heatmap  = False
     show_controls = bool(getattr(cfg, "SHOW_CONTROLS", True))
+    # The controls panel is shown on start so a first-time user sees the keys,
+    # then gets out of the way on its own. K pins it open (or closed) for good.
+    controls_shown_at = time.monotonic()
+    controls_pinned   = False
     fullscreen    = False
     enhance_mode  = False
     quit_flag     = False
@@ -3929,7 +3931,11 @@ def run(cfg: Config):
                 f"{'[PAUSED] ' if player.paused else ''}"
                 f"Infer:{snap.inference_ms:.0f}ms"
             )
-            if show_controls:
+            _auto_hidden = (not controls_pinned
+                            and cfg.CONTROLS_AUTOHIDE_SEC > 0
+                            and time.monotonic() - controls_shown_at
+                                > cfg.CONTROLS_AUTOHIDE_SEC)
+            if show_controls and not _auto_hidden:
                 draw_controls_overlay(display, cfg, player, gate_mgr, show_boxes, show_heads,
                                       show_zones, show_heatmap, show_stats, enhance_mode, det_worker)
             cv2.imshow(WIN_NAME, display)
@@ -3956,7 +3962,14 @@ def run(cfg: Config):
             quit_flag = True
 
         elif key == ord("k"):
-            show_controls = not show_controls
+            # If the panel faded out on its own, K brings it back rather than
+            # toggling an already-hidden panel off again.
+            _hidden_now = (not controls_pinned
+                           and cfg.CONTROLS_AUTOHIDE_SEC > 0
+                           and time.monotonic() - controls_shown_at
+                               > cfg.CONTROLS_AUTOHIDE_SEC)
+            show_controls   = True if _hidden_now else (not show_controls)
+            controls_pinned = True          # user asked: stop auto-hiding
 
         elif key == ord("p"):
             player.paused = not player.paused
