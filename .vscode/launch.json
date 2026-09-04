@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Crowd Master",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\crowd_master_v2.py",
+      "python": "${workspaceFolder}\\venv\\Scripts\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Crowd Master (headless, 600 frames)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\crowd_master_v2.py",
+      "python": "${workspaceFolder}\\venv\\Scripts\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "CROWD_MASTER_HEADLESS": "1",
+        "CROWD_MASTER_MAX_FRAMES": "600"
+      }
+    },
+    {
+      "name": "Gate counting test",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\tests\\test_gate_counting.py",
+      "python": "${workspaceFolder}\\venv\\Scripts\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

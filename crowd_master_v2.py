@@ -3813,6 +3813,7 @@ def run(cfg: Config):
     zone_counts: Dict[str, int] = {z: 0 for z in cfg.ZONES}
     last_frame_id = 0
     last_frame    = None
+    needs_redraw  = True   # force the first paint
     fps_hist      = deque(maxlen=30)
     last_draw_t   = time.perf_counter()
 
@@ -3832,16 +3833,33 @@ def run(cfg: Config):
         # Don't quit — keep processing and logging, just no display window
 
     while not quit_flag:
+        got_new = False
         try:
             fid, raw = player.display_queue.get_nowait()
             last_frame_id = fid
             last_frame    = raw
+            got_new       = True
         except queue.Empty:
             raw = last_frame
 
         if raw is None:
             safe_wait_key(10)
             continue
+
+        # ★ FIX: this loop used to redraw and re-imshow on every iteration, even
+        # when the player had not produced a new frame — so at 24 fps of video it
+        # was rebuilding and pushing the same image hundreds of times a second.
+        # All of that is Python-level work on the main thread, and it starved the
+        # detection thread through the GIL: measured 43 ms/frame headless versus
+        # 98-219 ms with the window open. Redraw only when there is something new
+        # to show, or when a keypress changed what is on screen.
+        carried_key = None
+        if not (got_new or needs_redraw):
+            rk = safe_wait_key(4)
+            if rk < 0:
+                continue                 # nothing new, no input — stay idle
+            carried_key = rk             # a key arrived: draw once and handle it
+        needs_redraw = False
 
         snap = result.snapshot()
 
@@ -3926,8 +3944,10 @@ def run(cfg: Config):
             quit_flag = True
             continue
 
-        raw_key = safe_wait_key(1)
+        raw_key = carried_key if carried_key is not None else safe_wait_key(1)
         key = (raw_key & 0xFF) if raw_key >= 0 else 255
+        if raw_key >= 0:
+            needs_redraw = True          # reflect whatever the key changed
 
         if key == ord("q"):
             quit_flag = True
