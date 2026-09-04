@@ -1,46 +1,21 @@
-# Python
+# Virtual environment
+venv/
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
 
-# Virtual environments
-venv/
-env/
-.venv/
+# Model weights (large, re-downloadable from ultralytics)
+*.pt
+*.onnx
 
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# Model weights (too large for GitHub)
-DATA/best_crowd_model*.pth
-DATA/crowd_model.onnx
+# Runtime data / generated artifacts
 DATA/replay_buffer.pkl
+DATA/*.log
+DATA/crowd_log.csv
+DATA/drift_events.csv
+DATA/crowd_report.*
+DATA/crowd_report_report.png
+DATA/snapshots/
 
-# Logs & reports (generated at runtime)
-*.log
-crowd_master.log
-DATA/*.csv
-DATA/*.txt
-DATA/*.pdf
-DATA/*.png
-
-# Video files
+# Local scratch
+install_torch.txt
 *.mp4
-*.avi
-*.mov
-*.mkv
-*.webm
-
-# Gates are project-specific — keep if you want
-# DATA/gates.json
-
-# OS
-.DS_Store
-Thumbs.db

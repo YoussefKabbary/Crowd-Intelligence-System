@@ -11,7 +11,7 @@
 ║    ✓ Center-based tracking (EMA) — no more box trailing            ║
 ║    ✓ Head offset prediction — head never lost                      ║
 ║    ✓ Adaptive inference resolution based on real FPS               ║
-║    ✓ D key — toggle detection on/off (tracking continues)          ║
+║    ✓ O key — toggle detection on/off (tracking continues)          ║
 ║    ✓ All v5.1 fixes retained                                       ║
 ║                                                                      ║
 ║  ARCHITECTURE: 6-Thread async pipeline                               ║
@@ -32,7 +32,7 @@
 ║    Z zones  F full    I enhance  T TTA    E ONNX    Ctrl+R train    ║
 ║    G gate-draw   TAB select-gate   R reverse   ESC deselect         ║
 ║    X delete-selected  (X clears all when nothing selected)          ║
-║    D  toggle detection on/off (tracking keeps running)              ║
+║    O  toggle detection on/off (tracking keeps running)              ║
 ║    +/-  speed   V/C volume   ]/[ zoom   WASD/arrows pan             ║
 ║    .  seek+5s   ,  seek-5s   (audio starts automatically)           ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -77,15 +77,52 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+_LOG_FILE = str(Path(__file__).parent / "DATA" / "crowd_master.log")
+Path(_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     handlers=[
-        logging.FileHandler("crowd_master.log", encoding="utf-8"),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("CrowdMaster")
+
+_HIGHGUI_AVAILABLE = None
+_HIGHGUI_WARNING_LOGGED = False
+
+
+def highgui_available() -> bool:
+    """Return True when this OpenCV build can create desktop windows."""
+    global _HIGHGUI_AVAILABLE, _HIGHGUI_WARNING_LOGGED
+    # Always re-check — never cache a False result permanently
+    test_win = "__crowd_master_highgui_test__"
+    try:
+        cv2.namedWindow(test_win, cv2.WINDOW_NORMAL)
+        cv2.destroyWindow(test_win)
+        _HIGHGUI_AVAILABLE = True
+    except cv2.error as exc:
+        _HIGHGUI_AVAILABLE = False
+        if not _HIGHGUI_WARNING_LOGGED:
+            logger.warning(
+                "OpenCV HighGUI is unavailable (%s). Install a GUI-enabled OpenCV wheel "
+                "with: pip uninstall -y opencv-python-headless opencv-python; "
+                "pip install opencv-python",
+                str(exc).splitlines()[0],
+            )
+            _HIGHGUI_WARNING_LOGGED = True
+    return _HIGHGUI_AVAILABLE
+
+
+def safe_wait_key(delay: int = 1) -> int:
+    if not highgui_available():
+        time.sleep(max(delay, 1) / 1000.0)
+        return -1
+    try:
+        return cv2.waitKey(delay)
+    except cv2.error:
+        return -1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -103,6 +140,11 @@ class Config:
     # Default video path - can be overridden with CROWD_MASTER_VIDEO env var
     _default_video = _base_dir / "test_video.mp4"
     VIDEO_PATH  = str(Path(os.getenv("CROWD_MASTER_VIDEO", _default_video)))
+    INPUT_MODE  = os.getenv("CROWD_MASTER_INPUT_MODE", "file")  # file | webcam | rtsp
+    CAMERA_INDEX = int(os.getenv("CROWD_MASTER_CAMERA_INDEX", "0"))
+    CAMERA_URL   = os.getenv("CROWD_MASTER_CAMERA_URL", "")
+    CAMERA_BUFFER_SIZE = 1
+    SHOW_CONTROLS = True
     
     LOG_FILE    = str(_data_dir / "crowd_log.csv")
     REPORT_FILE = str(_data_dir / "crowd_report.txt")
@@ -248,6 +290,29 @@ class Config:
 # ══════════════════════════════════════════════════════════════
 #  GATE
 # ══════════════════════════════════════════════════════════════
+
+def resolve_video_source(cfg: Config):
+    mode = str(getattr(cfg, "INPUT_MODE", "file")).lower().strip()
+    if mode == "webcam":
+        return int(getattr(cfg, "CAMERA_INDEX", 0))
+    if mode == "rtsp":
+        return str(getattr(cfg, "CAMERA_URL", "")).strip()
+    source = str(getattr(cfg, "VIDEO_PATH", "")).strip()
+    return int(source) if source.isdigit() else source
+
+
+def is_live_source(cfg: Config) -> bool:
+    return str(getattr(cfg, "INPUT_MODE", "file")).lower().strip() in ("webcam", "rtsp")
+
+
+def source_label(cfg: Config) -> str:
+    mode = str(getattr(cfg, "INPUT_MODE", "file")).lower().strip()
+    if mode == "webcam":
+        return f"Webcam {getattr(cfg, 'CAMERA_INDEX', 0)}"
+    if mode == "rtsp":
+        url = str(getattr(cfg, "CAMERA_URL", "")).strip()
+        return "IP Camera" if len(url) > 42 else f"IP Camera {url}"
+    return Path(str(getattr(cfg, "VIDEO_PATH", ""))).name
 class Gate:
     MIN_CROSS_FRAMES = 1
     RESET_DIST_MULT  = 1.8   # ★ FIX: was 2.5 → re-trigger sooner
@@ -1563,7 +1628,7 @@ class DetectionWorker(threading.Thread):
         self._infer_times = deque(maxlen=60)
         self._box_ema: Dict[int, np.ndarray] = {}
         self._BOX_ALPHA = 0.88   # ★ FIX: was 0.60 → faster box following
-        # Detection toggle (D key)
+        # Detection toggle (O key)
         self.detection_enabled = True
         # Center tracker for smooth, center-based tracking
         self.center_tracker = CenterTracker(
@@ -1607,7 +1672,7 @@ class DetectionWorker(threading.Thread):
             sx     = orig_w / self._cur_w
             sy     = orig_h / self._cur_h
 
-            # ── Skip detection if toggled off (D key) ────────
+            # ── Skip detection if toggled off (O key) ────────
             if not self.detection_enabled:
                 # Still update center tracker with no new data
                 self.center_tracker.update(np.zeros((0,4)), None)
@@ -2293,9 +2358,13 @@ class LoadingScreen:
         self.current = 0
         self._w, self._h = 820, 310
         self._win    = "Loading"
-        cv2.namedWindow(self._win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self._win, self._w, self._h)
-        self._draw(0, "Initializing...")
+        self._enabled = highgui_available()
+        if self._enabled:
+            cv2.namedWindow(self._win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self._win, self._w, self._h)
+            self._draw(0, "Initializing...")
+        else:
+            logger.info("Loading: Initializing...")
 
     def step(self, label: str = ""):
         self.current += 1
@@ -2303,7 +2372,8 @@ class LoadingScreen:
         lbl = label or (self.steps[self.current-1]
                         if self.current-1 < len(self.steps) else "")
         self._draw(pct, lbl)
-        cv2.waitKey(1)
+        if self._enabled:
+            safe_wait_key(1)
 
     def _draw(self, pct: int, label: str):
         img = np.full((self._h, self._w, 3), (18,18,18), dtype=np.uint8)
@@ -2327,12 +2397,16 @@ class LoadingScreen:
         cv2.putText(img, f"Step {self.current}/{self.total}",
                     (self._w-165, 268), cv2.FONT_HERSHEY_SIMPLEX,
                     0.43, (100,100,100), 1, cv2.LINE_AA)
-        cv2.imshow(self._win, img)
+        if self._enabled:
+            cv2.imshow(self._win, img)
+        else:
+            logger.info("Loading %d%% - %s", pct, label)
 
     def done(self):
         self._draw(100, "Ready!")
-        cv2.waitKey(700)
-        cv2.destroyWindow(self._win)
+        if self._enabled:
+            safe_wait_key(700)
+            cv2.destroyWindow(self._win)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2690,8 +2764,21 @@ def generate_pdf_report(peak_track: PeakTimeTracker,
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Image as RLI
-        doc = SimpleDocTemplate(cfg.PDF_REPORT, pagesize=A4)
-        doc.build([RLI(png_path, width=A4[0]-40, height=A4[1]-40)])
+        # حساب الأبعاد بحيث تتناسب مع الصفحة بدون overflow
+        page_w, page_h = A4
+        margin = 40
+        max_w = page_w - margin * 2
+        max_h = page_h - margin * 2
+        # حافظ على نسبة الأبعاد
+        import PIL.Image as PILImg
+        with PILImg.open(png_path) as pil_img:
+            iw, ih = pil_img.size
+        ratio = min(max_w / iw, max_h / ih)
+        draw_w, draw_h = iw * ratio, ih * ratio
+        doc = SimpleDocTemplate(cfg.PDF_REPORT, pagesize=A4,
+                                leftMargin=margin, rightMargin=margin,
+                                topMargin=margin, bottomMargin=margin)
+        doc.build([RLI(png_path, width=draw_w, height=draw_h)])
         logger.info(f"PDF: {cfg.PDF_REPORT}")
     except ImportError:
         logger.info("reportlab not installed — PNG saved.")
@@ -2809,6 +2896,82 @@ class CenterTracker:
 #  Simple GUI that lets the user pick a video file before
 #  the OpenCV window opens. No config editing required.
 # ══════════════════════════════════════════════════════════════
+
+
+def save_snapshot(frame: np.ndarray, cfg: Config, prefix: str = "snapshot") -> Optional[str]:
+    try:
+        shot_dir = Path(cfg._data_dir) / "snapshots"
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = shot_dir / f"{prefix}_{ts}.jpg"
+        ok = cv2.imwrite(str(out_path), frame)
+        if ok:
+            logger.info(f"Snapshot saved: {out_path}")
+            return str(out_path)
+        logger.error(f"Snapshot save failed: {out_path}")
+    except Exception as exc:
+        logger.error(f"Snapshot save failed: {exc}")
+    return None
+def draw_controls_overlay(frame: np.ndarray, cfg: Config, player, gate_mgr: GateManager,
+                          show_boxes: bool, show_heads: bool, show_zones: bool,
+                          show_heatmap: bool, show_stats: bool, enhance_mode: bool,
+                          det_worker) -> None:
+    h, w = frame.shape[:2]
+    panel_w = min(520, max(360, w - 40))
+    panel_h = 315
+    x1, y1 = 18, 48
+    x2, y2 = x1 + panel_w, min(y1 + panel_h, h - 18)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 24, 32), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (78, 204, 163), 2)
+
+    def put(text_value, x, y, color=(235, 235, 235), scale=0.47, thick=1):
+        cv2.putText(frame, text_value, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thick, cv2.LINE_AA)
+
+    put("CONTROLS  (K hide/show)", x1 + 16, y1 + 28, (78, 204, 163), 0.58, 2)
+    status = [
+        f"Source: {source_label(cfg)}",
+        f"Speed: {player.speed:.2f}x",
+        f"Detection: {'ON' if getattr(det_worker, 'detection_enabled', True) else 'OFF'}",
+        f"Gates: {len(gate_mgr.gates)}   In:{gate_mgr.total_entry} Out:{gate_mgr.total_exit}",
+    ]
+    yy = y1 + 58
+    for line in status:
+        put(line, x1 + 16, yy, (210, 220, 230), 0.45)
+        yy += 21
+
+    left = [
+        "Q quit", "P pause/resume", "C snapshot", "+/- speed",
+        "[/] zoom", "WASD / arrows pan", "R reset view", "K controls"
+    ]
+    right = [
+        "B boxes", "H heads", "N stats", "Z zones", "M heatmap",
+        "I enhance", "T TTA", "O detection on/off"
+    ]
+    yy = y1 + 155
+    put("Playback", x1 + 16, yy, (255, 210, 120), 0.48, 2)
+    put("AI / View", x1 + panel_w//2, yy, (255, 210, 120), 0.48, 2)
+    yy += 24
+    for i in range(max(len(left), len(right))):
+        if i < len(left):
+            put(left[i], x1 + 20, yy, (235, 235, 235), 0.43)
+        if i < len(right):
+            put(right[i], x1 + panel_w//2, yy, (235, 235, 235), 0.43)
+        yy += 21
+
+    flags = [
+        ("Boxes", show_boxes), ("Heads", show_heads), ("Stats", show_stats),
+        ("Zones", show_zones), ("Heat", show_heatmap), ("Enhance", enhance_mode),
+    ]
+    bx = x1 + 16
+    by = y2 - 22
+    for name, enabled in flags:
+        col = (78, 204, 163) if enabled else (95, 95, 105)
+        cv2.circle(frame, (bx, by - 4), 5, col, -1)
+        put(name, bx + 10, by, (220, 220, 220), 0.38)
+        bx += 78
 class VideoLauncher:
     """
     Shows a clean Tkinter window with:
@@ -2832,7 +2995,7 @@ class VideoLauncher:
             return cfg.VIDEO_PATH if os.path.exists(cfg.VIDEO_PATH) else None
 
         root = tk.Tk()
-        root.title("Crowd Master v5  —  Select Video")
+        root.title("Crowd Master v5  —  Select Source")
         root.resizable(False, False)
         root.configure(bg="#1a1a2e")
 
@@ -2858,10 +3021,22 @@ class VideoLauncher:
         tk.Label(root, text="Enterprise AI Surveillance Platform",
                  font=("Segoe UI", 9), bg=BG, fg="#888").pack(pady=(0, 14))
 
+        # ── Input source ─────────────────────────────────────
+        mode_var = tk.StringVar(value=getattr(self.cfg, "INPUT_MODE", "file"))
+        mode_frm = tk.Frame(root, bg=BG)
+        mode_frm.pack(fill="x", padx=24, pady=4)
+        tk.Label(mode_frm, text="Source:", font=FONT,
+                 bg=BG, fg=WHITE, width=12, anchor="w").pack(side="left")
+        for value, label in (("file", "Video File"), ("webcam", "Webcam"), ("rtsp", "IP / RTSP")):
+            tk.Radiobutton(mode_frm, text=label, value=value, variable=mode_var,
+                           font=FONT, bg=BG, fg=WHITE, selectcolor=DARK2,
+                           activebackground=BG, activeforeground=ACCENT).pack(side="left", padx=(4, 12))
+
         # ── Video path ──────────────────────────────────────
         frm = tk.Frame(root, bg=BG)
         frm.pack(fill="x", padx=24, pady=4)
-        tk.Label(frm, text="Video File:", font=FONT,
+        source_label_var = tk.StringVar(value="Video File:")
+        tk.Label(frm, textvariable=source_label_var, font=FONT,
                  bg=BG, fg=WHITE, width=12, anchor="w").pack(side="left")
 
         path_var = tk.StringVar(value=self.cfg.VIDEO_PATH)
@@ -2870,6 +3045,8 @@ class VideoLauncher:
                               insertbackground=WHITE, relief="flat",
                               width=46)
         path_entry.pack(side="left", padx=(4, 6))
+        cam_var = tk.StringVar(value=str(getattr(self.cfg, "CAMERA_INDEX", 0)))
+        rtsp_var = tk.StringVar(value=str(getattr(self.cfg, "CAMERA_URL", "")))
 
         def browse():
             f = filedialog.askopenfilename(
@@ -2882,9 +3059,29 @@ class VideoLauncher:
             if f:
                 path_var.set(f)
 
-        tk.Button(frm, text="Browse…", command=browse,
-                  font=FONT, bg=BTN_BG, fg=ACCENT,
-                  relief="flat", padx=10, cursor="hand2").pack(side="left")
+        browse_btn = tk.Button(frm, text="Browse...", command=browse,
+                               font=FONT, bg=BTN_BG, fg=ACCENT,
+                               relief="flat", padx=10, cursor="hand2")
+        browse_btn.pack(side="left")
+
+        def refresh_source_fields(*_):
+            mode = mode_var.get()
+            if mode == "file":
+                source_label_var.set("Video File:")
+                path_var.set(self.cfg.VIDEO_PATH)
+                path_entry.configure(textvariable=path_var, state="normal")
+                browse_btn.configure(state="normal")
+            elif mode == "webcam":
+                source_label_var.set("Camera ID:")
+                path_entry.configure(textvariable=cam_var, state="normal")
+                browse_btn.configure(state="disabled")
+            else:
+                source_label_var.set("RTSP URL:")
+                path_entry.configure(textvariable=rtsp_var, state="normal")
+                browse_btn.configure(state="disabled")
+
+        mode_var.trace_add("write", refresh_source_fields)
+        refresh_source_fields()
 
         # ── Data dir ────────────────────────────────────────
         frm2 = tk.Frame(root, bg=BG)
@@ -2902,7 +3099,7 @@ class VideoLauncher:
         tk.Button(frm2, text="Change…", command=browse_dir,
                   font=FONT, bg=BTN_BG, fg=ACCENT,
                   relief="flat", padx=10, cursor="hand2").pack(side="left")
-"Kabbary"
+
         # ── Device info ─────────────────────────────────────
         sep = tk.Frame(root, bg="#333", height=1)
         sep.pack(fill="x", padx=24, pady=10)
@@ -2929,7 +3126,7 @@ class VideoLauncher:
         sep2 = tk.Frame(root, bg="#333", height=1)
         sep2.pack(fill="x", padx=24, pady=10)
         hints = ("Q quit  P pause  G gate-draw  TAB select  "
-                 "]/[ zoom  WASD pan  I enhance  D detect  +/- speed")
+                 "]/[ zoom  WASD pan  I enhance  O detect  +/- speed")
         tk.Label(root, text=hints, font=("Segoe UI", 8),
                  bg=BG, fg="#666", wraplength=520).pack(pady=(0, 6))
 
@@ -2940,16 +3137,30 @@ class VideoLauncher:
         started = {"v": False}
 
         def on_start():
-            p = path_var.get().strip()
-            if not p:
-                messagebox.showerror("Error", "Please select a video file.")
-                return
-            if not os.path.exists(p):
-                messagebox.showerror(
-                    "File Not Found",
-                    f"Video not found:\n{p}\n\nPlease choose a valid file.")
-                return
-            self.cfg.VIDEO_PATH = p
+            mode = mode_var.get()
+            p = path_var.get().strip() if mode == "file" else ""
+            if mode == "file":
+                if not p:
+                    messagebox.showerror("Error", "Please select a video file.")
+                    return
+                if not os.path.exists(p):
+                    messagebox.showerror(
+                        "File Not Found",
+                        f"Video not found:\n{p}\n\nPlease choose a valid file.")
+                    return
+                self.cfg.VIDEO_PATH = p
+            elif mode == "webcam":
+                try:
+                    self.cfg.CAMERA_INDEX = int(cam_var.get().strip() or "0")
+                except ValueError:
+                    messagebox.showerror("Error", "Camera ID must be a number, usually 0 or 1.")
+                    return
+            else:
+                self.cfg.CAMERA_URL = rtsp_var.get().strip()
+                if not self.cfg.CAMERA_URL:
+                    messagebox.showerror("Error", "Please enter the IP camera / RTSP URL.")
+                    return
+            self.cfg.INPUT_MODE = mode
             self.cfg._data_dir  = Path(dir_var.get())
             self.cfg._data_dir.mkdir(parents=True, exist_ok=True)
             # Update all paths
@@ -2962,7 +3173,7 @@ class VideoLauncher:
             self.cfg.ONNX_PATH   = str(self.cfg._data_dir / "crowd_model.onnx")
             self.cfg.GATES_FILE  = str(self.cfg._data_dir / "gates.json")
             self.cfg.USE_FP16    = fp16_var.get()
-            self.result = p
+            self.result = source_label(self.cfg)
             started["v"] = True
             root.destroy()
 
@@ -3065,27 +3276,33 @@ def run(cfg: Config):
     retrainer.start()
 
     loader.step("Opening video stream...")
-    cap = cv2.VideoCapture(cfg.VIDEO_PATH)
+    video_source = resolve_video_source(cfg)
+    cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
-        logger.error(f"Cannot open: {cfg.VIDEO_PATH}")
+        logger.error(f"Cannot open source: {source_label(cfg)}")
         loader.done(); return
 
     fps     = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    logger.info(f"Video: {frame_w}x{frame_h}  FPS:{fps:.1f}  Device:{cfg.DEVICE}")
+    if is_live_source(cfg):
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.CAMERA_BUFFER_SIZE)
+    logger.info(f"Source: {source_label(cfg)}  {frame_w}x{frame_h}  FPS:{fps:.1f}  Device:{cfg.DEVICE}")
 
     loader.step("Starting Video Player thread...")
     player = VideoPlayerThread(cap, fps, cfg)
     player.start()
 
     audio_player: NullAudioPlayer = NullAudioPlayer()
-    _aud_thread = AudioPlayerThread(cfg.VIDEO_PATH, fps=fps)
-    _aud_thread.start()
-    def _swap_audio():
-        nonlocal audio_player
-        audio_player = _aud_thread
-    threading.Timer(0.3, _swap_audio).start()
+    if not is_live_source(cfg):
+        _aud_thread = AudioPlayerThread(cfg.VIDEO_PATH, fps=fps)
+        _aud_thread.start()
+        def _swap_audio():
+            nonlocal audio_player
+            audio_player = _aud_thread
+        threading.Timer(0.3, _swap_audio).start()
+    else:
+        logger.info("Audio disabled for live camera sources.")
 
     result = DetectionResult()
     result.crowd_thr = cfg.CROWD_THRESHOLD
@@ -3122,6 +3339,7 @@ def run(cfg: Config):
     show_zones    = False
     show_heads    = True
     show_heatmap  = False
+    show_controls = bool(getattr(cfg, "SHOW_CONTROLS", True))
     fullscreen    = False
     enhance_mode  = False
     quit_flag     = False
@@ -3131,7 +3349,15 @@ def run(cfg: Config):
     fps_hist      = deque(maxlen=30)
     last_draw_t   = time.perf_counter()
 
-    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    display_enabled = highgui_available()
+    if display_enabled:
+        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    else:
+        logger.warning(
+            "OpenCV HighGUI unavailable — running in headless mode (no video window). "
+            "To get the video window: pip uninstall -y opencv-python-headless opencv-python && pip install opencv-python"
+        )
+        # Don't quit — keep processing and logging, just no display window
 
     while not quit_flag:
         try:
@@ -3142,7 +3368,7 @@ def run(cfg: Config):
             raw = last_frame
 
         if raw is None:
-            cv2.waitKey(10)
+            safe_wait_key(10)
             continue
 
         snap = result.snapshot()
@@ -3195,26 +3421,33 @@ def run(cfg: Config):
 
         _gsel = (f"[G{gate_mgr.gates[gate_mgr.selected_idx].gate_id} sel | R=rev ESC=desel]  "
                  if 0 <= gate_mgr.selected_idx < len(gate_mgr.gates) else "")
-        cv2.setWindowTitle(
-            WIN_NAME,
-            f"Crowd Master v5  |  {frame_w}x{frame_h}  |  "
-            f"People:{snap.final_count}  Accurate:{getattr(snap,'accurate_count',snap.final_count)}  "
-            f"Gates In:{gate_mgr.total_entry} Out:{gate_mgr.total_exit}  |  "
-            f"Spd:{player.speed:.1f}x  Zm:{pz.zoom:.1f}x  |  "
-            f"{_gsel}"
-            f"{'[PAUSED] ' if player.paused else ''}"
-            f"Infer:{snap.inference_ms:.0f}ms"
-        )
-        cv2.imshow(WIN_NAME, display)
+        if display_enabled:
+            cv2.setWindowTitle(
+                WIN_NAME,
+                f"Crowd Master v5  |  {frame_w}x{frame_h}  |  "
+                f"People:{snap.final_count}  Accurate:{getattr(snap,'accurate_count',snap.final_count)}  "
+                f"Gates In:{gate_mgr.total_entry} Out:{gate_mgr.total_exit}  |  "
+                f"Spd:{player.speed:.1f}x  Zm:{pz.zoom:.1f}x  |  "
+                f"{_gsel}"
+                f"{'[PAUSED] ' if player.paused else ''}"
+                f"Infer:{snap.inference_ms:.0f}ms"
+            )
+            if show_controls:
+                draw_controls_overlay(display, cfg, player, gate_mgr, show_boxes, show_heads,
+                                      show_zones, show_heatmap, show_stats, enhance_mode, det_worker)
+            cv2.imshow(WIN_NAME, display)
 
-        raw_key = cv2.waitKey(1)
+        raw_key = safe_wait_key(1)
         key = (raw_key & 0xFF) if raw_key >= 0 else 255
 
         if key == ord("q"):
             quit_flag = True
 
-        elif cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
+        elif display_enabled and cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
             quit_flag = True
+
+        elif key == ord("k"):
+            show_controls = not show_controls
 
         elif key == ord("p"):
             player.paused = not player.paused
@@ -3268,11 +3501,7 @@ def run(cfg: Config):
                 pass
 
         elif key == ord("c"):
-            try:
-                v = getattr(audio_player, "_vol", 1.0)
-                audio_player.set_volume(max(0.0, v - 0.1))
-            except Exception:
-                pass
+            save_snapshot(display, cfg)
 
         elif key == ord("]"):
             pz.zoom_in()
@@ -3308,8 +3537,8 @@ def run(cfg: Config):
         elif key == ord("t"):
             det_worker.use_tta = not det_worker.use_tta
 
-        elif key == ord("d"):
-            # D = toggle detection ON/OFF (tracking continues)
+        elif key == ord("o"):
+            # O = toggle detection ON/OFF (tracking continues)
             det_worker.detection_enabled = not det_worker.detection_enabled
             logger.info(
                 f"Detection: {'ON' if det_worker.detection_enabled else 'OFF (tracking only)'}")
@@ -3365,7 +3594,8 @@ def run(cfg: Config):
     final_save = cfg.model_save_path()
     torch.save(cnn_model.state_dict(), final_save)
     cap.release()
-    cv2.destroyAllWindows()
+    if highgui_available():
+        cv2.destroyAllWindows()
 
     session_stats = {
         "frames":       last_frame_id,
@@ -3413,8 +3643,7 @@ if __name__ == "__main__":
         if not chosen:
             logger.info("No video selected — exiting.")
             sys.exit(0)
-        cfg.VIDEO_PATH = chosen
-        logger.info(f"Video selected: {chosen}")
+        logger.info(f"Source selected: {chosen}")
 
     # ── Startup validation ─────────────────────────────────────
     logger.info("=" * 70)
@@ -3427,10 +3656,9 @@ if __name__ == "__main__":
             logger.info(f"GPU      : {torch.cuda.get_device_name(0)}")
         except Exception:
             logger.info("GPU      : CUDA available")
-    logger.info(f"Video    : {Path(cfg.VIDEO_PATH).name}")
+    logger.info(f"Source   : {source_label(cfg)}")
     logger.info(f"Data dir : {cfg._data_dir}")
-
-    if not os.path.exists(cfg.VIDEO_PATH):
+    if not is_live_source(cfg) and not os.path.exists(cfg.VIDEO_PATH):
         logger.error("Video file not found: " + cfg.VIDEO_PATH)
         sys.exit(1)
 
@@ -3439,4 +3667,3 @@ if __name__ == "__main__":
     logger.info("=" * 70)
 
     run(cfg)
-"Lets start from Kabbary"
