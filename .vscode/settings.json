@@ -1,6 +1,10 @@
 {
-  "python.defaultInterpreterPath": "C:\\Users\\DELL\\Desktop\\crowd-master-v2\\venv\\Scripts\\python.exe",
+  "python.defaultInterpreterPath": "${workspaceFolder}\\venv\\Scripts\\python.exe",
   "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}\\venv\\Lib\\site-packages"
+  ],
+  "python.analysis.typeCheckingMode": "basic",
   "files.exclude": {
     "**/__pycache__": true,
     "**/*.pyc": true

@@ -52,15 +52,56 @@ from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as T
-import torchvision.models as models
-from torch.utils.data import DataLoader, TensorDataset
-from ultralytics import YOLO
-from PIL import Image
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import torchvision
+    import torchvision.transforms as T
+    import torchvision.models as models
+    from torch.utils.data import DataLoader, TensorDataset
+    from ultralytics import YOLO
+    from PIL import Image
+except ImportError as _exc:
+    # Almost always this means the script was launched with the wrong Python —
+    # the system interpreter instead of the project's venv (VS Code's Run button
+    # uses whichever interpreter is selected, which is not necessarily this one).
+    _venv_py = Path(__file__).resolve().parent / "venv" / "Scripts" / "python.exe"
+    _msg = [
+        "",
+        "=" * 68,
+        f"  Crowd Master cannot start: {_exc.name!r} is not installed",
+        "  in the Python that launched it.",
+        "=" * 68,
+        f"  Running under : {sys.executable}",
+    ]
+    if _venv_py.exists():
+        _msg += [
+            f"  Should be     : {_venv_py}",
+            "",
+            "  Run it with the project's environment instead:",
+            "",
+            f'      cd "{Path(__file__).resolve().parent}"',
+            "      venv\\Scripts\\python.exe crowd_master_v2.py",
+            "",
+            "  Or just double-click run_crowd_master.cmd.",
+            "",
+            "  In VS Code: Ctrl+Shift+P -> 'Python: Select Interpreter'",
+            "              -> .\\venv\\Scripts\\python.exe",
+        ]
+    else:
+        _msg += [
+            "",
+            "  No venv found next to this script. Create one:",
+            "",
+            "      python -m venv venv",
+            "      venv\\Scripts\\python.exe -m pip install torch==2.11.0 "
+            "torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130",
+            "      venv\\Scripts\\python.exe -m pip install -r requirements.txt",
+        ]
+    _msg += ["=" * 68, ""]
+    print("\n".join(_msg), file=sys.stderr)
+    sys.exit(1)
 
 # ── Tkinter GUI launcher ─────────────────────────────────────
 try:
