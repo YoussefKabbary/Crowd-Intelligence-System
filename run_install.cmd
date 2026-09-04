@@ -1,0 +1,1 @@
+C:\Users\DELL\Desktop\crowd-master-v2\venv\Scripts\python.exe -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130 --timeout 180 --retries 5 > C:\Users\DELL\Desktop\crowd-master-v2\install_torch.txt 2>&1

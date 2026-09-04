@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+__pycache__/
+*.py[cod]
+
+# Model weights (large, re-downloadable from ultralytics)
+*.pt
+*.onnx
+
+# Runtime data / generated artifacts
+DATA/replay_buffer.pkl
+DATA/*.log
+DATA/crowd_log.csv
+DATA/drift_events.csv
+DATA/crowd_report.*
+DATA/crowd_report_report.png
+DATA/snapshots/
+
+# Local scratch
+install_torch.txt
+*.mp4
