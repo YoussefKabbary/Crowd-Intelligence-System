@@ -5,6 +5,11 @@ cd /d "%~dp0"
 if not exist "venv\Scripts\python.exe" (
     echo ERROR: The project virtual environment was not found.
     echo Expected: %CD%\venv\Scripts\python.exe
+    echo.
+    echo Create it with:
+    echo     python -m venv venv
+    echo     venv\Scripts\python.exe -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+    echo     venv\Scripts\python.exe -m pip install -r requirements.txt
     pause
     exit /b 1
 )
