@@ -63,6 +63,8 @@ Everything is overridable by environment variable — no code edits needed.
 | `CROWD_MASTER_TRACKER` | `bytetrack.yaml` | or `botsort.yaml` |
 | `CROWD_MASTER_ONLINE_LEARNING` | `0` | see "Online learning" below |
 | `CROWD_MASTER_LOG_EVERY_SEC` | `2` | CSV sampling interval |
+| `CROWD_MASTER_CUDNN_BENCHMARK` | `0` | cuDNN autotune — see "Startup time" |
+| `CROWD_MASTER_CONTROLS_SEC` | `12` | seconds before the controls panel auto-hides (0 = never) |
 | `CROWD_MASTER_HEADLESS` | `0` | no window, no key waits |
 | `CROWD_MASTER_MAX_FRAMES` | `0` | stop after N frames (0 = unlimited) |
 | `CROWD_MASTER_LOOP` | `1` (`0` headless) | loop the video at end |
@@ -76,6 +78,31 @@ Everything is overridable by environment variable — no code edits needed.
 On the RTX 3050 this project targets, `yolov8s` is **faster** than `yolov8n`
 (18.6 ms vs 25.0 ms at 960×540 FP16) — the nano model is too small to keep the
 GPU busy. `s` is therefore the default for both detectors.
+
+### Startup time
+
+Roughly 11 seconds from launch to the first detection, most of which is
+importing torch/ultralytics and initialising the CUDA context — largely fixed
+costs. Two things that used to make it far worse:
+
+`torch.backends.cudnn.benchmark` is **off**. It autotunes convolution algorithms
+per input shape, which only pays off when the shape never changes; ultralytics
+letterboxes frames to varying sizes, so the search is repeated rather than
+amortised. Measured over four alternating runs it cost about 20 seconds of
+startup and made steady state no faster:
+
+| | benchmark=False | benchmark=True |
+|---|---|---|
+| first inference | 9.0 / 18.4 s | 26.9 / 32.6 s |
+| startup total | 31.6 / 41.7 s | 51.8 / 52.6 s |
+| steady state | 79 / 134 ms | 82 / 149 ms |
+
+The second detector used by sliced inference and TTA is loaded on first use
+rather than at launch, since slicing only engages once a scene is dense.
+
+Note the spread in those steady-state figures: the same binary measures 43 ms on
+an idle machine and over 130 ms with a couple of busy background processes. Take
+any single timing here as indicative, not exact.
 
 ### Online learning
 
