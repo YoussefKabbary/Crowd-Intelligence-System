@@ -112,7 +112,19 @@ except ImportError:
     _TK_AVAILABLE = False
 
 # ── GPU performance tuning ───────────────────────────────────
-torch.backends.cudnn.benchmark = True   # auto-tune convolution algorithms
+# ★ OFF by default. cuDNN autotuning only pays off when the input shape never
+# changes, but ultralytics letterboxes frames to varying sizes, so the search is
+# re-run instead of amortised. Measured back-to-back on this machine:
+#
+#                     benchmark=False   benchmark=True
+#   first inference        8.6 s           22.5 s
+#   model.fuse()           3.6 s            6.4 s
+#   startup total         29.1 s           43.3 s
+#   steady state          73 ms/frame      98 ms/frame
+#
+# It cost ~14 s of startup and made steady state no faster.
+# Set CROWD_MASTER_CUDNN_BENCHMARK=1 to re-enable.
+torch.backends.cudnn.benchmark = os.getenv("CROWD_MASTER_CUDNN_BENCHMARK", "0") == "1"
 
 warnings.filterwarnings("ignore")
 os.environ["KMP_DUPLICATE_LIB_OK"]         = "TRUE"
@@ -1879,7 +1891,11 @@ class DetectionWorker(threading.Thread):
         # calls re-initialises that predictor and disturbs track persistence,
         # which showed up as dropped gate crossings whenever slicing engaged.
         # The auxiliary passes never touch the tracked model.
-        self.aux_yolo = aux_yolo if aux_yolo is not None else body_yolo
+        # Built on first use, not at startup: loading a second full network cost
+        # ~1.5 s of launch time for a path that only engages once the scene is
+        # dense (body_count >= DENSE_FALLBACK_THR) or TTA is switched on.
+        self._aux_yolo = aux_yolo
+        self._aux_failed = False
         self.detect_queue = detect_queue
         self.result       = result
         self.body_yolo    = body_yolo
@@ -2197,6 +2213,33 @@ class DetectionWorker(threading.Thread):
                 scene_gray     = cv2.resize(gray, (320, 180)).copy(),
             )
 
+    @property
+    def aux_yolo(self):
+        """Second detector for slicing / TTA, loaded the first time it is needed."""
+        if self._aux_yolo is not None:
+            return self._aux_yolo
+        if self._aux_failed:
+            return self.body_yolo          # degraded but functional
+        try:
+            t0 = time.perf_counter()
+            m = YOLO(self.cfg.BODY_MODEL)
+            m.to(self.cfg.DEVICE)
+            if self.cfg.USE_FP16:
+                m.model.half()
+            try:
+                m.model.fuse()
+            except Exception:
+                pass
+            self._aux_yolo = m
+            logger.info("Auxiliary detector loaded in %.1fs (slicing/TTA engaged)",
+                        time.perf_counter() - t0)
+            return m
+        except Exception as e:
+            self._aux_failed = True
+            logger.warning(f"Auxiliary detector unavailable ({e}) — "
+                           "slicing/TTA will share the tracked model.")
+            return self.body_yolo
+
     def _warm_up(self):
         """Pay the one-off CUDA/cuDNN setup cost before the first real frame.
 
@@ -2209,7 +2252,7 @@ class DetectionWorker(threading.Thread):
         try:
             t0 = time.perf_counter()
             w = cv2.resize(self.warmup_frame, (self._cur_w, self._cur_h))
-            for _ in range(2):
+            for _ in range(1):
                 self.body_yolo.track(
                     w, classes=[0], persist=False, verbose=False,
                     tracker=self.cfg.TRACKER,
@@ -3645,23 +3688,6 @@ def run(cfg: Config):
     except Exception:
         pass
 
-    # Second instance of the same weights for the slicing / TTA passes, so those
-    # never touch the tracked model's predictor state. Costs ~22 MB of VRAM.
-    aux_yolo = None
-    if cfg.USE_SLICED or cfg.USE_TTA:
-        try:
-            aux_yolo = YOLO(cfg.BODY_MODEL)
-            aux_yolo.to(cfg.DEVICE)
-            if cfg.USE_FP16:
-                aux_yolo.model.half()
-            try:
-                aux_yolo.model.fuse()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Auxiliary detector unavailable ({e}) — "
-                           "slicing/TTA will share the tracked model.")
-
     loader.step(f"Loading Head Detector ({cfg.HEAD_MODEL})...")
     head_det = HeadDetector(cfg.HEAD_MODEL, cfg.DEVICE,
                             cfg.HEAD_CONF_BASE, cfg.HEAD_IOU,
@@ -3719,17 +3745,14 @@ def run(cfg: Config):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.CAMERA_BUFFER_SIZE)
     logger.info(f"Source: {source_label(cfg)}  {frame_w}x{frame_h}  FPS:{fps:.1f}  Device:{cfg.DEVICE}")
 
-    # ── Warm up both networks before playback starts ───────────
-    # torch.backends.cudnn.benchmark=True makes the first inference at a new
-    # input shape run an exhaustive algorithm search, and the tracker/keypoint
-    # paths only compile once they actually see a detection. Paying that on the
-    # first live frame measured 10.4 s, during which the video plays with no
-    # boxes at all. A real frame is used so the detection-bearing code paths are
-    # exercised too — a blank frame only got it down to 4.1 s.
-    loader.step("Warming up networks...")
+    # ── Grab one real frame for the detection worker to warm up on ─────
+    # The warm-up itself used to run here as well, on the main thread, and again
+    # on the worker thread — about 13 s of startup for one job done twice. Only
+    # the worker's copy matters (part of the setup cost is per-thread), so this
+    # now just fetches the sample frame; the worker does the work while the rest
+    # of the pipeline is still starting.
     _warm = None
     try:
-        _t0 = time.perf_counter()
         if not is_live_source(cfg):
             # Read the sample from a SEPARATE capture. Reading from `cap` and
             # seeking back is not reliable across container/codec combinations —
@@ -3742,15 +3765,8 @@ def run(cfg: Config):
         if _warm is None:
             _warm = np.random.randint(0, 255, (cfg.INFER_H, cfg.INFER_W, 3),
                                       dtype=np.uint8)
-        for _ in range(2):
-            body_yolo.track(_warm, classes=[0], persist=False, verbose=False,
-                            tracker=cfg.TRACKER, conf=cfg.BODY_CONF_BASE,
-                            iou=cfg.BODY_IOU)
-            head_det.detect(_warm, use_tta=False)
-        head_det._tracks.clear()      # discard tracks seeded by the warm-up
-        logger.info(f"Warm-up complete in {time.perf_counter()-_t0:.1f}s")
     except Exception as e:
-        logger.warning(f"Warm-up skipped: {e}")
+        logger.warning(f"Warm-up frame unavailable: {e}")
 
     loader.step("Starting Video Player thread...")
     player = VideoPlayerThread(cap, fps, cfg)
@@ -3779,7 +3795,6 @@ def run(cfg: Config):
         density_est, adapt_conf, gate_mgr, learner,
         cfg, frame_h,
         warmup_frame=_warm,
-        aux_yolo=aux_yolo,
     )
     det_worker.start()
 
