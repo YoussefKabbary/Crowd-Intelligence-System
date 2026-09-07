@@ -224,6 +224,9 @@ class Config:
     CAMERA_URL   = os.getenv("CROWD_MASTER_CAMERA_URL", "")
     CAMERA_BUFFER_SIZE = 1
     SHOW_CONTROLS = True
+    # Overlays are drawn at this width minimum, so a small clip's HUD is not
+    # stretched by the window. 0 disables the upscale.
+    HUD_MIN_WIDTH = int(os.getenv("CROWD_MASTER_HUD_MIN_WIDTH", "1280"))
     # Seconds the controls panel stays up before fading out on its own.
     # Press K to pin it open (or closed). 0 disables auto-hide.
     CONTROLS_AUTOHIDE_SEC = float(os.getenv("CROWD_MASTER_CONTROLS_SEC", "12"))
@@ -2771,6 +2774,11 @@ class CrowdHeatmap:
         if self.heat.max() < 0.001:
             return frame
         norm    = np.clip(self.heat / (self.heat.max()+1e-5), 0, 1)
+        # The heat buffer is kept at video resolution while the display frame may
+        # have been upscaled for the overlays, so match the target before blending.
+        fh, fw = frame.shape[:2]
+        if norm.shape != (fh, fw):
+            norm = cv2.resize(norm, (fw, fh), interpolation=cv2.INTER_LINEAR)
         colored = cv2.applyColorMap((norm*255).astype(np.uint8), cv2.COLORMAP_JET)
         mask    = np.stack([(norm > 0.05).astype(np.float32)]*3, axis=-1)
         return (colored.astype(np.float32)*alpha*mask +
@@ -2962,6 +2970,232 @@ def draw_zones(frame: np.ndarray, zones_dict: dict,
 # ══════════════════════════════════════════════════════════════
 #  STATS DASHBOARD
 # ══════════════════════════════════════════════════════════════
+class HudRenderer:
+    """Draws the stats panel with a real TrueType font.
+
+    The panel used to be painted with cv2.putText and OpenCV's Hershey stroke
+    fonts, at the *video's* resolution — 240x360 px on a 640x360 clip, a third of
+    the frame — and the window then scaled that up to its own size, so every
+    glyph was stretched about 3x. Coarse strokes plus a 3x upscale is why the
+    readout looked so rough.
+
+    Two changes fix it: text is rendered by PIL with a real font, and the display
+    loop upscales small frames before the HUD goes on, so the panel is drawn near
+    the resolution it will actually be viewed at.
+
+    Rendering the panel costs ~8.5 ms, so it is cached and re-rendered only when
+    the values change (and at most at REFRESH_HZ). Compositing the cached panel
+    is ~0.17 ms, which is what runs on most frames.
+    """
+
+    REFRESH_HZ = 8.0
+
+    # Restrained palette. The old panel used eight competing hues for what is
+    # mostly neutral data; colour now carries meaning — accent for the headline
+    # count, amber/red only for conditions that want attention.
+    C_BG     = (16, 18, 23)
+    C_LABEL  = (150, 158, 170)
+    C_VALUE  = (232, 236, 242)
+    C_ACCENT = (110, 214, 232)
+    C_OK     = (120, 205, 120)
+    C_WARN   = (240, 176, 74)
+    C_ALERT  = (238, 106, 100)
+    C_RULE   = (46, 52, 62)
+
+    _FONT_DIRS = (r"C:\Windows\Fonts",
+                  "/usr/share/fonts/truetype/dejavu",
+                  "/Library/Fonts")
+    _FONT_NAMES = {"r": ("segoeui.ttf", "DejaVuSans.ttf", "arial.ttf", "Arial.ttf"),
+                   "b": ("segoeuib.ttf", "DejaVuSans-Bold.ttf", "arialbd.ttf",
+                         "Arial Bold.ttf")}
+
+    def __init__(self):
+        self._panel = None
+        self._key = None
+        self._last = 0.0
+        self._fonts: Dict[Tuple[str, int], Any] = {}
+        self.truetype_ok = True
+
+    def _font(self, weight: str, size: int):
+        key = (weight, size)
+        if key in self._fonts:
+            return self._fonts[key]
+        from PIL import ImageFont
+        font = None
+        for name in self._FONT_NAMES[weight]:
+            for base in self._FONT_DIRS:
+                try:
+                    font = ImageFont.truetype(os.path.join(base, name), size)
+                    break
+                except Exception:
+                    continue
+            if font is not None:
+                break
+        if font is None:                    # no TrueType anywhere — degrade
+            font = ImageFont.load_default()
+            self.truetype_ok = False
+        self._fonts[key] = font
+        return font
+
+    def render(self, snap, gate_mgr, retrain_status: str,
+               enhance_mode: bool, scale: float):
+        """Return the panel as a BGR array, re-rendering only when needed."""
+        acc = getattr(snap, "accurate_count", snap.final_count)
+        drift = snap.drift_score if snap.drift_score == snap.drift_score else 0.0
+        key = (snap.status, snap.body_count, snap.head_count,
+               len(snap.orphan_heads or []), snap.density_est, snap.final_count,
+               acc, gate_mgr.total_entry, gate_mgr.total_exit, snap.crowd_thr,
+               tuple(sorted((snap.forecasts or {}).items())), round(drift, 2),
+               round(snap.anomaly_score, 2), int(snap.inference_ms),
+               round(snap.adaptive_conf, 2), retrain_status, enhance_mode,
+               tuple((snap.anomalies or [])[:2]), round(scale, 2))
+        now = time.monotonic()
+        if (self._panel is not None and key == self._key
+                and now - self._last < 1.0 / self.REFRESH_HZ):
+            return self._panel
+        self._key = key
+        self._last = now
+        try:
+            self._panel = self._draw(snap, gate_mgr, retrain_status,
+                                     enhance_mode, scale, acc, drift)
+        except Exception as e:
+            logger.warning(f"HUD render failed: {e}")
+            self._panel = None
+        return self._panel
+
+    def _draw(self, snap, gate_mgr, retrain_status, enhance_mode,
+              scale, acc, drift):
+        from PIL import Image, ImageDraw
+        S = scale
+        px = lambda v: max(1, int(round(v * S)))
+        W       = px(230)
+        pad     = px(14)
+        row_h   = px(19)
+        f_label = self._font("r", px(13))
+        f_value = self._font("b", px(13))
+        f_head  = self._font("b", px(17))
+        f_big   = self._font("b", px(23))
+        f_small = self._font("r", px(11))
+
+        gates = bool(gate_mgr.gates)
+        entry = gate_mgr.total_entry if gates else snap.entry_count
+        exit_ = gate_mgr.total_exit if gates else snap.exit_count
+        fc = snap.forecasts or {}
+        sections = [
+            ("DETECTED", [
+                ("Bodies",  str(snap.body_count),              self.C_VALUE),
+                ("Heads",   str(snap.head_count),              self.C_VALUE),
+                ("Extra",   str(len(snap.orphan_heads or [])), self.C_LABEL),
+                ("Density", str(snap.density_est),             self.C_LABEL),
+            ]),
+            ("FLOW", [
+                ("In",  str(entry),                self.C_OK),
+                ("Out", str(exit_),                self.C_WARN),
+                ("Net", f"{entry - exit_:+d}",     self.C_VALUE),
+            ]),
+            ("FORECAST", [
+                ("5 sec",  str(fc.get(5, 0)),   self.C_VALUE),
+                ("30 sec", str(fc.get(30, 0)),  self.C_VALUE),
+                ("1 min",  str(fc.get(60, 0)),  self.C_VALUE),
+                ("5 min",  str(fc.get(300, 0)), self.C_VALUE),
+            ]),
+            ("SYSTEM", [
+                ("Threshold",  str(snap.crowd_thr),        self.C_LABEL),
+                ("Drift",      f"{drift:.2f}",             self.C_LABEL),
+                ("Anomaly",    f"{snap.anomaly_score:.2f}",
+                 self.C_ALERT if snap.anomaly_score > 0.5 else self.C_LABEL),
+                ("Inference",  f"{snap.inference_ms:.0f} ms", self.C_LABEL),
+                ("Confidence", f"{snap.adaptive_conf:.2f}",   self.C_LABEL),
+                ("Enhance",    "on" if enhance_mode else "off", self.C_LABEL),
+            ]),
+        ]
+        alerts = (snap.anomalies or [])[:2]
+
+        H = pad + px(26) + px(48)
+        for _t, rows in sections:
+            H += px(16) + row_h * len(rows) + px(8)
+        H += px(10)
+        if alerts:
+            H += px(6) + px(16) * len(alerts)
+        H += pad
+
+        img = Image.new("RGB", (W, H), self.C_BG)
+        d = ImageDraw.Draw(img)
+        y = pad
+
+        ok = snap.status == "Normal"
+        status_col = self.C_OK if ok else self.C_ALERT
+        d.rectangle([0, 0, px(3), H], fill=status_col)     # status spine
+        d.text((pad, y), "NORMAL" if ok else "CROWDED", font=f_head, fill=status_col)
+        y += px(28)
+
+        # The two numbers people actually read, given room to breathe.
+        total = str(snap.final_count)
+        d.text((pad, y), total, font=f_big, fill=self.C_VALUE)
+        tw = d.textlength(total, font=f_big)
+        d.text((pad + tw + px(7), y + px(10)), "people", font=f_small, fill=self.C_LABEL)
+        d.text((W - pad, y + px(2)), str(acc), font=f_head, fill=self.C_ACCENT, anchor="ra")
+        d.text((W - pad, y + px(21)), "accurate", font=f_small, fill=self.C_LABEL, anchor="ra")
+        y += px(48)
+
+        for title, rows in sections:
+            d.line([pad, y, W - pad, y], fill=self.C_RULE, width=1)
+            d.text((pad, y + px(3)), title, font=f_small, fill=self.C_LABEL)
+            y += px(16)
+            for label, value, col in rows:
+                d.text((pad, y), label, font=f_label, fill=self.C_LABEL)
+                d.text((W - pad, y), value, font=f_value, fill=col, anchor="ra")
+                y += row_h
+            y += px(8)
+
+        bw = W - pad * 2
+        d.rectangle([pad, y, pad + bw, y + px(3)], fill=self.C_RULE)
+        fill = int(min(max(drift, 0.0), 1.0) * bw)
+        if fill > 0:
+            dc = (self.C_ALERT if drift > 0.4 else
+                  self.C_WARN if drift > 0.2 else self.C_OK)
+            d.rectangle([pad, y, pad + fill, y + px(3)], fill=dc)
+        y += px(10)
+
+        for a in alerts:
+            d.text((pad, y), f"! {a}", font=f_label, fill=self.C_ALERT)
+            y += px(16)
+
+        return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
+_HUD = HudRenderer()
+
+
+def _blend(frame: np.ndarray, patch: np.ndarray, x0: int, y0: int,
+           alpha: float = 0.88) -> None:
+    """Alpha-blend a BGR patch onto the frame, clipped to its bounds."""
+    h, w = frame.shape[:2]
+    ph, pw = patch.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x0 + pw), min(h, y0 + ph)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = frame[y0:y1, x0:x1]
+    cv2.addWeighted(patch[:y1 - y0, :x1 - x0], alpha, roi, 1.0 - alpha, 0, dst=roi)
+
+
+def _chip(frame: np.ndarray, text: str, colour, x_right: int, y_top: int,
+          scale: float) -> None:
+    """Small pill of text, right-aligned at x_right."""
+    from PIL import Image, ImageDraw
+    px = lambda v: max(1, int(round(v * scale)))
+    f = _HUD._font("b", px(13))
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    cw = int(probe.textlength(text, font=f)) + px(18)
+    ch = px(26)
+    chip = Image.new("RGB", (cw, ch), HudRenderer.C_BG)
+    ImageDraw.Draw(chip).text((cw // 2, ch // 2), text, font=f,
+                              fill=colour, anchor="mm")
+    _blend(frame, cv2.cvtColor(np.asarray(chip), cv2.COLOR_RGB2BGR),
+           x_right - cw, y_top, 0.82)
+
+
 def draw_dashboard(frame: np.ndarray,
                    snap: DetectionResult,
                    gate_mgr: GateManager,
@@ -2974,126 +3208,30 @@ def draw_dashboard(frame: np.ndarray,
                    use_sliced: bool,
                    enhance_mode: bool = False):
     h, w = frame.shape[:2]
+    S = max(0.75, min(1.6, w / 1280.0))
+    px = lambda v: max(1, int(round(v * S)))
 
-    # ★ Two permanent key-hint lines used to be painted along the bottom edge at
-    # 0.32 scale in dark grey. On anything narrower than about 1400 px they ran
-    # off the frame and overlapped each other into an unreadable smear, and they
-    # duplicated the controls panel (K) which now shows the same keys legibly.
-
-    hud = (f"{'[||] ' if paused else ''}"
-           f"Spd:{speed:.1f}x  Zm:{pz.zoom:.1f}x"
-           f"  {'[ENH]' if enhance_mode else ''}"
-           f"  {'TTA' if use_tta else ''}"
-           f"  {'SLI' if use_sliced else ''}")
-    (tw,th),_ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
-    hx = w - tw - 10
-    ov = frame.copy()
-    cv2.rectangle(ov, (hx-5,5), (hx+tw+5,26), (0,0,0), -1)
-    cv2.addWeighted(ov, 0.60, frame, 0.40, 0, frame)
-    hc = (0,180,255) if not paused else (0,100,255)
-    cv2.putText(frame, hud, (hx,21),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.44, hc, 1, cv2.LINE_AA)
+    hud = f"{speed:.1f}x    zoom {pz.zoom:.1f}x"
+    if use_tta:
+        hud += "    TTA"
+    if use_sliced:
+        hud += "    SLICE"
+    if paused:
+        hud = "PAUSED    " + hud
+    _chip(frame, hud,
+          HudRenderer.C_ALERT if paused else HudRenderer.C_LABEL,
+          w - px(10), px(10), S)
 
     if not show_stats:
-        clr = (50,220,80) if snap.status == "Normal" else (40,50,220)
-        cv2.putText(frame, f"People: {snap.final_count}  [{snap.status}]",
-                    (10,38), cv2.FONT_HERSHEY_SIMPLEX, 0.80, clr, 2, cv2.LINE_AA)
-        acc = getattr(snap, "accurate_count", snap.final_count)
-        cv2.putText(frame, f"Accurate: {acc}",
-                    (10,68), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,255), 2, cv2.LINE_AA)
+        ok = snap.status == "Normal"
+        _chip(frame, f"{snap.final_count} people    {snap.status}",
+              HudRenderer.C_OK if ok else HudRenderer.C_ALERT,
+              px(10) + px(230), px(10), S)
         return frame
 
-    PW=240; PH=360; PX=8; PY=8
-    panel = frame.copy()
-    cv2.rectangle(panel, (PX,PY), (PX+PW,PY+PH), (10,10,10), -1)
-    cv2.addWeighted(panel, 0.82, frame, 0.18, 0, frame)
-    sc = snap.status == "Normal"
-    cv2.rectangle(frame, (PX,PY), (PX+PW,PY+PH),
-                  (40,160,40) if sc else (40,40,210), 1)
-
-    W2=(225,225,225); GR=(60,215,80); RD=(50,55,215); OR=(40,150,255)
-    YL=(30,205,255); CY=(200,200,0); PP=(200,80,200); TL=(165,195,50)
-    GY=(150,150,150); CR=(80,130,255)
-    sd = snap.drift_score if snap.drift_score == snap.drift_score else 0.0
-
-    FS  = 0.38
-    FS2 = 0.44
-
-    def row(txt: str, col: tuple, y: int, sc2=None, th2: int = 1):
-        cv2.putText(frame, txt, (PX+7, PY+y),
-                    cv2.FONT_HERSHEY_SIMPLEX, sc2 or FS, col, th2, cv2.LINE_AA)
-
-    def sep(y: int):
-        cv2.line(frame, (PX+4,PY+y), (PX+PW-4,PY+y), (55,55,55), 1)
-
-    cv2.putText(frame, "[OK] Normal" if sc else "[!!] Crowded",
-                (PX+7, PY+16), cv2.FONT_HERSHEY_SIMPLEX,
-                FS2, GR if sc else RD, 2, cv2.LINE_AA)
-    sep(22)
-
-    acc = getattr(snap, "accurate_count", snap.final_count)
-    row(f"Body   : {snap.body_count}",           W2,  36)
-    row(f"Heads  : {snap.head_count}",           CR,  50)
-    row(f"Extra+ : {len(snap.orphan_heads)}",    CY,  64)
-    row(f"Density: {snap.density_est}",          GY,  78)
-    sep(85)
-
-    cv2.putText(frame, f"TOTAL  : {snap.final_count}",
-                (PX+7, PY+100), cv2.FONT_HERSHEY_SIMPLEX,
-                0.46, YL, 2, cv2.LINE_AA)
-
-    cv2.rectangle(frame, (PX+3, PY+106), (PX+PW-3, PY+122), (25,25,25), -1)
-    cv2.putText(frame, f"ACCURATE: {acc}",
-                (PX+7, PY+119), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, (0,220,255), 2, cv2.LINE_AA)
-    sep(125)
-
-    if gate_mgr.gates:
-        row(f"Gate In : {gate_mgr.total_entry}",  GR,  138)
-        row(f"Gate Out: {gate_mgr.total_exit}",   OR,  151)
-        _net = gate_mgr.total_entry - gate_mgr.total_exit
-        row(f"Net Flow: {_net:+d}",  GR if _net >= 0 else RD, 164)
-        sep(171); ny = 183
-    else:
-        row(f"Entry  : {snap.entry_count}",       GR,  138)
-        row(f"Exit   : {snap.exit_count}",        OR,  151)
-        _net2 = snap.entry_count - snap.exit_count
-        row(f"Net    : {_net2:+d}",  GR if _net2>=0 else RD, 164)
-        sep(171); ny = 183
-
-    row(f"Thresh : {snap.crowd_thr}",             YL,  ny)
-    sep(ny+7)
-
-    row(f"5s     : {snap.forecasts.get(5,0)}",    TL,  ny+19)
-    row(f"30s    : {snap.forecasts.get(30,0)}",   TL,  ny+31)
-    row(f"60s    : {snap.forecasts.get(60,0)}",   TL,  ny+43)
-    row(f"5min   : {snap.forecasts.get(300,0)}",  TL,  ny+55)
-    sep(ny+62)
-
-    row(f"Drift  : {sd:.2f}",                     PP,  ny+74)
-    row(f"Anomaly: {snap.anomaly_score:.2f}",     OR,  ny+86)
-    row(f"InfMs  : {snap.inference_ms:.1f}",      GY,  ny+98)
-    row(f"Conf   : {snap.adaptive_conf:.2f}",     GY,  ny+110)
-    row(f"Upd    : {snap.online_updates}",        GY,  ny+122)
-    row(f"Retrain: {retrain_status}",             GY,  ny+134)
-    enh_col = (0,220,255) if enhance_mode else GY
-    row(f"Enh    : {'ON [I]' if enhance_mode else 'OFF [I]'}", enh_col, ny+146)
-    sep(ny+153)
-
-    bx = PX+7; by = PY+ny+162; blen = PW-16
-    cv2.rectangle(frame, (bx,by), (bx+blen,by+5), (40,40,40), -1)
-    _fill = int(min(sd,1.0)*blen)
-    if _fill > 0:
-        _dc = RD if sd>0.4 else OR if sd>0.2 else GR
-        cv2.rectangle(frame, (bx,by), (bx+_fill,by+5), _dc, -1)
-    cv2.putText(frame, "drift", (bx+blen+3,by+5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, GY, 1, cv2.LINE_AA)
-
-    for _i, _alert in enumerate((snap.anomalies or [])[:2]):
-        cv2.putText(frame, f"!! {_alert}",
-                    (PX+7, PY+PH+14+_i*14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, RD, 2, cv2.LINE_AA)
-
+    panel = _HUD.render(snap, gate_mgr, retrain_status, enhance_mode, S)
+    if panel is not None:
+        _blend(frame, panel, px(10), px(10), 0.88)
     return frame
 
 
@@ -3357,63 +3495,94 @@ def save_snapshot(frame: np.ndarray, cfg: Config, prefix: str = "snapshot") -> O
     except Exception as exc:
         logger.error(f"Snapshot save failed: {exc}")
     return None
+_CONTROLS_CACHE: Dict[tuple, np.ndarray] = {}
+
+
 def draw_controls_overlay(frame: np.ndarray, cfg: Config, player, gate_mgr: GateManager,
                           show_boxes: bool, show_heads: bool, show_zones: bool,
                           show_heatmap: bool, show_stats: bool, enhance_mode: bool,
                           det_worker) -> None:
-    # ★ REWRITTEN. The old panel was a fixed 520x315 box pinned to the top-left.
-    # On a 640x360 clip that is 81% of the width and 87% of the height — it
-    # buried both the video and the stats dashboard, which is also top-left.
-    # It is now sized relative to the frame, anchored bottom-right away from the
-    # dashboard, and its key list matches the actual bindings (snapshot moved
-    # from C to S when C became volume-down).
+    """Key reference, bottom-right, in the same typeface as the stats panel.
+
+    Was drawn with cv2.putText in a fixed 520x315 box pinned top-left — on a
+    640x360 clip that is 81% of the width, on top of the dashboard, in a stroke
+    font the window then stretched. It now shares HudRenderer's TrueType setup so
+    both overlays look like one piece of UI.
+    """
+    from PIL import Image, ImageDraw
+
     h, w = frame.shape[:2]
-    s = max(0.62, min(1.15, w / 1280.0))          # scale with the video
-    fs_title, fs_key, fs_dot = 0.46 * s, 0.38 * s, 0.34 * s
-    line_h  = int(17 * s)
-    pad     = int(12 * s)
+    S = max(0.75, min(1.6, w / 1280.0))
+    px = lambda v: max(1, int(round(v * S)))
 
-    left = ["Q quit", "P pause", "S snapshot", "+/- speed",
-            "[ ] zoom", "WAD/arrows pan", "R reset view"]
-    right = ["B boxes", "H heads", "N stats", "Z zones",
-             "M heatmap", "G gate draw", "O detect on/off"]
+    # Nothing here changes unless a toggle flips or the window is resized, so
+    # the rendered panel is cached; redrawing it every frame cost ~3 ms.
+    ck = (round(S, 2), show_boxes, show_heads, show_zones, show_heatmap,
+          show_stats, enhance_mode)
+    cached = _CONTROLS_CACHE.get(ck)
+    if cached is not None:
+        _blend(frame, cached, w - cached.shape[1] - px(12),
+               h - cached.shape[0] - px(12), 0.84)
+        return
 
-    col_w   = int(140 * s)
-    panel_w = min(int(col_w * 2 + pad * 3), int(w * 0.62))
-    panel_h = min(int(pad * 2 + line_h * (len(left) + 3)), int(h * 0.72))
-    x2, y2  = w - int(14 * s), h - int(14 * s)
-    x1, y1  = x2 - panel_w, y2 - panel_h
+    f_title = _HUD._font("b", px(12))
+    f_key   = _HUD._font("b", px(12))
+    f_desc  = _HUD._font("r", px(12))
+    f_dot   = _HUD._font("r", px(11))
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 24, 32), -1)
-    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (78, 204, 163), 1, cv2.LINE_AA)
-
-    def put(text_value, x, y, color=(235, 235, 235), scale=fs_key, thick=1):
-        cv2.putText(frame, text_value, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, thick, cv2.LINE_AA)
-
-    yy = y1 + pad + int(12 * s)
-    put("CONTROLS   K hide", x1 + pad, yy, (78, 204, 163), fs_title, 1)
-    yy += line_h + int(3 * s)
-    for i in range(max(len(left), len(right))):
-        if i < len(left):
-            put(left[i],  x1 + pad, yy)
-        if i < len(right):
-            put(right[i], x1 + pad + col_w, yy)
-        yy += line_h
-
-    # Active-toggle dots along the bottom edge of the panel.
+    left = [("Q", "quit"), ("P", "pause"), ("S", "snapshot"), ("+/-", "speed"),
+            ("[ ]", "zoom"), ("WAD", "pan"), ("R", "reset view")]
+    right = [("B", "boxes"), ("H", "heads"), ("N", "stats"), ("Z", "zones"),
+             ("M", "heatmap"), ("G", "gate draw"), ("O", "detection")]
     flags = [("Box", show_boxes), ("Head", show_heads), ("Stat", show_stats),
              ("Zone", show_zones), ("Heat", show_heatmap), ("Enh", enhance_mode)]
-    bx = x1 + pad
-    by = y2 - int(9 * s)
-    step = (panel_w - pad * 2) // len(flags)
-    for name, enabled in flags:
-        col = (78, 204, 163) if enabled else (95, 95, 105)
-        cv2.circle(frame, (bx, by - int(4 * s)), max(2, int(3 * s)), col, -1)
-        put(name, bx + int(8 * s), by, (200, 200, 205), fs_dot)
-        bx += step
+
+    pad    = px(13)
+    row_h  = px(17)
+    key_w  = px(34)
+    col_w  = px(118)
+    PW = pad * 2 + col_w * 2
+    PH = pad + px(15) + row_h * len(left) + px(10) + px(14) + pad
+
+    panel = Image.new("RGB", (PW, PH), HudRenderer.C_BG)
+    d = ImageDraw.Draw(panel)
+
+    d.text((pad, pad), "CONTROLS", font=f_title, fill=HudRenderer.C_ACCENT)
+    d.text((PW - pad, pad), "K to hide", font=f_dot,
+           fill=HudRenderer.C_LABEL, anchor="ra")
+    y = pad + px(17)
+
+    for i in range(max(len(left), len(right))):
+        for col, items in ((0, left), (1, right)):
+            if i >= len(items):
+                continue
+            key, desc = items[i]
+            x = pad + col * col_w
+            d.text((x, y), key, font=f_key, fill=HudRenderer.C_VALUE)
+            d.text((x + key_w, y), desc, font=f_desc, fill=HudRenderer.C_LABEL)
+        y += row_h
+
+    y += px(6)
+    d.line([pad, y, PW - pad, y], fill=HudRenderer.C_RULE, width=1)
+    y += px(6)
+
+    # Which view toggles are currently on.
+    step = (PW - pad * 2) // len(flags)
+    for i, (name, on) in enumerate(flags):
+        x = pad + i * step
+        col = HudRenderer.C_OK if on else HudRenderer.C_RULE
+        r = max(2, px(3))
+        cy = y + px(5)
+        d.ellipse([x, cy - r, x + r * 2, cy + r], fill=col)
+        d.text((x + r * 2 + px(5), y), name, font=f_dot,
+               fill=HudRenderer.C_VALUE if on else HudRenderer.C_LABEL)
+
+    arr = cv2.cvtColor(np.asarray(panel), cv2.COLOR_RGB2BGR)
+    _CONTROLS_CACHE.clear()          # only ever holds the current variant
+    _CONTROLS_CACHE[ck] = arr
+    _blend(frame, arr, w - PW - px(12), h - PH - px(12), 0.84)
+
+
 class VideoLauncher:
     """
     Shows a clean Tkinter window with:
@@ -3893,27 +4062,45 @@ def run(cfg: Config):
 
         display = raw.copy()
 
+        # ★ Upscale FIRST, then draw everything at the enlarged size.
+        # Overlays used to be painted at the video's own resolution and the
+        # window then stretched the result to its size — on a 640x360 clip in a
+        # 1920-wide window that is a 3x blow-up of every glyph and every box
+        # outline, which is why the readout and the id labels looked so rough.
+        # Drawing after the resize means text is rendered at the size it is
+        # actually viewed at. Box, head, zone and gate coordinates are in video
+        # space, so they are scaled by the same factor. ~2.7 ms for 640x360.
+        vs = 1.0
+        if cfg.HUD_MIN_WIDTH and display.shape[1] < cfg.HUD_MIN_WIDTH:
+            vs = cfg.HUD_MIN_WIDTH / display.shape[1]
+            display = cv2.resize(
+                display,
+                (cfg.HUD_MIN_WIDTH, int(round(display.shape[0] * vs))),
+                interpolation=cv2.INTER_LINEAR)
+
         all_centers = (list(snap.head_centers or []) + list(snap.orphan_heads or []))
         heatmap.update(all_centers)
         if show_heatmap:
             display = heatmap.render(display, alpha=0.55)
 
         if show_boxes and snap.body_boxes is not None and len(snap.body_boxes) > 0:
-            draw_boxes(display, snap.body_boxes,
+            draw_boxes(display, np.asarray(snap.body_boxes) * vs,
                        snap.body_ids, snap.body_confs,
                        snap.crowd_thr, cfg)
 
         if show_heads:
+            _sc = lambda pts: [(int(x * vs), int(y * vs)) for (x, y) in pts]
             draw_heads(display,
-                       snap.head_centers or [],
-                       snap.orphan_heads or [], cfg)
+                       _sc(snap.head_centers or []),
+                       _sc(snap.orphan_heads or []), cfg)
 
         if show_zones:
-            draw_zones(display, cfg.ZONES, zone_counts, frame_w, frame_h)
+            draw_zones(display, cfg.ZONES, zone_counts,
+                       display.shape[1], display.shape[0])
 
         # Gates live in video coordinates, so they are drawn BEFORE the pan/zoom
         # transform and travel with the footage.
-        gate_mgr.draw_preview(display, scale=1.0)
+        gate_mgr.draw_preview(display, scale=vs)
 
         display = pz.apply(display, enhance=enhance_mode)
 
