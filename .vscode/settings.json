@@ -4,7 +4,7 @@
   "python.analysis.extraPaths": [
     "${workspaceFolder}\\venv\\Lib\\site-packages"
   ],
-  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.typeCheckingMode": "off",
   "files.exclude": {
     "**/__pycache__": true,
     "**/*.pyc": true
