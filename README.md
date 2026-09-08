@@ -165,9 +165,31 @@ Runs with no window, stops on its own, and writes the CSV, TXT and PDF reports.
 venv/Scripts/python.exe tests/test_gate_counting.py
 ```
 
-Generates a clip with a known number of people crossing a known line and asserts
-the gate reports exactly that many entries. This is the regression test for the
-v5.2 bug where enabling sliced inference silently zeroed every gate count.
+Generates clips with a known number of people crossing a known line. This is the
+regression test for the v5.2 bug where enabling sliced inference silently zeroed
+every gate count.
+
+It runs two groups:
+
+**Sequential crossings — asserted.** People cross one at a time, so identity is
+unambiguous and the count must match exactly.
+
+**Simultaneous crossings — reported only.** Several people crossing together at
+the same speed is close to the worst case for a motion-only tracker: it swaps
+their IDs, and gate counting is identity-based, so the total is not dependable.
+Observed runs credit one ID with two crossings while missing another walker
+outright. The number is printed rather than asserted, because it moves with
+changes that have nothing to do with the gate — switching cuDNN autotuning off
+was enough to flip it. A number far from the expectation is a hint to look at
+tracker choice or re-identification, not evidence of a broken gate.
+
+### What gate counting can and cannot do
+
+It is dependable when people cross a line one at a time or clearly separated —
+a doorway, a turnstile, a corridor. It is **not** dependable for dense two-way
+flow through a wide opening, because the count is only as good as the tracker's
+ability to keep one ID on one person. Fixing that properly means
+re-identification (appearance features), not tuning thresholds.
 
 ## Measuring accuracy
 
