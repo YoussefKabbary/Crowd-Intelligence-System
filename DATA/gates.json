@@ -1,1 +1,74 @@
-[]
+[
+  {
+    "id": 0,
+    "x1": 1048,
+    "y1": 139,
+    "x2": 1022,
+    "y2": 74,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 1,
+    "x1": 1055,
+    "y1": 82,
+    "x2": 1032,
+    "y2": 74,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 2,
+    "x1": 1032,
+    "y1": 74,
+    "x2": 1016,
+    "y2": 240,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 3,
+    "x1": 1104,
+    "y1": 79,
+    "x2": 992,
+    "y2": 0,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 4,
+    "x1": 992,
+    "y1": 0,
+    "x2": 865,
+    "y2": 22,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 5,
+    "x1": 758,
+    "y1": 97,
+    "x2": 751,
+    "y2": 356,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 6,
+    "x1": 556,
+    "y1": 186,
+    "x2": 802,
+    "y2": 362,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  },
+  {
+    "id": 7,
+    "x1": 494,
+    "y1": 196,
+    "x2": 402,
+    "y2": 262,
+    "direction_mode": "auto",
+    "in_side": "positive"
+  }
+]

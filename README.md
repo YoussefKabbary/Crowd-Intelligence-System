@@ -65,6 +65,15 @@ Everything is overridable by environment variable — no code edits needed.
 | `CROWD_MASTER_LOG_EVERY_SEC` | `2` | CSV sampling interval |
 | `CROWD_MASTER_CUDNN_BENCHMARK` | `0` | cuDNN autotune — see "Startup time" |
 | `CROWD_MASTER_CONTROLS_SEC` | `12` | seconds before the controls panel auto-hides (0 = never) |
+| `CROWD_MASTER_HUD_MIN_WIDTH` | `1280` | draw overlays at this width minimum (0 = off) |
+| `CROWD_MASTER_SPEED_THRESH` | `30` | optical-flow magnitude that counts as running |
+| `CROWD_MASTER_DENSITY_JUMP` | `8` | count jump that counts as a surge |
+| `CROWD_MASTER_EVENT_CLIPS` | `1` | save a video clip around each anomaly |
+| `CROWD_MASTER_EVENT_PRE` | `5` | seconds of footage kept *before* the trigger |
+| `CROWD_MASTER_EVENT_POST` | `5` | seconds kept after |
+| `CROWD_MASTER_EVENT_COOLDOWN` | `30` | minimum seconds between clips |
+| `CROWD_MASTER_EVENT_WIDTH` | `960` | clips are downscaled to this width |
+| `CROWD_MASTER_EVENT_BUFFER_MB` | `192` | cap on the pre-roll buffer |
 | `CROWD_MASTER_HEADLESS` | `0` | no window, no key waits |
 | `CROWD_MASTER_MAX_FRAMES` | `0` | stop after N frames (0 = unlimited) |
 | `CROWD_MASTER_LOOP` | `1` (`0` headless) | loop the video at end |
@@ -104,6 +113,25 @@ Note the spread in those steady-state figures: the same binary measures 43 ms on
 an idle machine and over 130 ms with a couple of busy background processes. Take
 any single timing here as indicative, not exact.
 
+### Zones
+
+`Config.ZONES` maps a name to a rectangle in frame fractions `(x1, y1, x2, y2)`.
+Occupancy per zone is written to `crowd_log.csv` as a `zone_*` column, summarised
+in the session report (peak, average, busiest moment), and exposed on
+`/api/status`. That is what turns "how many people are in frame" into "how full
+was the hall at 18:30", which is usually the question worth asking.
+
+Two zone names that differ only by case are counted as separate areas and are
+indistinguishable in a report, so the tracker warns if it sees a pair.
+
+### Event clips
+
+When an anomaly fires, the seconds either side of it are written to
+`DATA/events/` with an `events.csv` index. Frames are buffered in memory ahead of
+the trigger, downscaled to `EVENT_WIDTH` and capped by `EVENT_BUFFER_MB`, so a
+5-second pre-roll costs a bounded amount however large the camera's frames are —
+at 1080p an uncapped buffer would be roughly 780 MB.
+
 ### Online learning
 
 The CNN crowd regressor and its online trainer are **off by default**. Measured
@@ -141,6 +169,26 @@ Generates a clip with a known number of people crossing a known line and asserts
 the gate reports exactly that many entries. This is the regression test for the
 v5.2 bug where enabling sliced inference silently zeroed every gate count.
 
+## Measuring accuracy
+
+Every other benchmark here measures speed. To find out whether the counts are
+*right*, label some frames by hand and compare:
+
+```bash
+venv\Scripts\python.exe tools\extract_frames.py clip.mp4 --count 200
+# fill in the count column of clip_labels/labels.csv
+venv\Scripts\python.exe tests\measure_accuracy.py clip.mp4 clip_labels/labels.csv
+```
+
+It reports MAE, RMSE and bias for each figure the system produces (`bodies`,
+`fused`, `smooth`, `accurate`), so you can see which to trust. Bias matters as
+much as MAE: a system consistently 2 low is easy to correct, one scattering ±4 is
+not. `--no-heads`, `--model` and `--infer-width` let you measure a change without
+editing code — for instance whether the pose model earns its 17-34 ms.
+
+Counting 200 frames takes about an hour, once. Until it exists, no change can be
+judged on accuracy — only on speed.
+
 ## Outputs
 
 Everything lands in `DATA/` (or `CROWD_MASTER_DATA_DIR`):
@@ -153,6 +201,8 @@ Everything lands in `DATA/` (or `CROWD_MASTER_DATA_DIR`):
 | `crowd_master.log` | run log |
 | `gates.json` | gate geometry, reloaded on next run |
 | `drift_events.csv` | scene-drift events |
+| `events/*.mp4` | clips saved around anomalies |
+| `events/events.csv` | index of those clips |
 
 ## Notes
 

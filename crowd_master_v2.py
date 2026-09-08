@@ -44,7 +44,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import cv2, csv, os, sys, time, logging, math, threading, pickle
+import cv2, csv, os, re, sys, time, logging, math, threading, pickle
 import warnings, random, queue, json, subprocess, tempfile, shutil
 import numpy as np
 from datetime import datetime, timedelta
@@ -224,6 +224,16 @@ class Config:
     CAMERA_URL   = os.getenv("CROWD_MASTER_CAMERA_URL", "")
     CAMERA_BUFFER_SIZE = 1
     SHOW_CONTROLS = True
+
+    # ── Event clips ────────────────────────────────────────────
+    # Save a short video around each anomaly. Without this an alert is a line of
+    # text with nothing to check it against.
+    EVENT_CLIPS        = os.getenv("CROWD_MASTER_EVENT_CLIPS", "1") == "1"
+    EVENT_PRE_SEC      = float(os.getenv("CROWD_MASTER_EVENT_PRE", "5"))
+    EVENT_POST_SEC     = float(os.getenv("CROWD_MASTER_EVENT_POST", "5"))
+    EVENT_COOLDOWN_SEC = float(os.getenv("CROWD_MASTER_EVENT_COOLDOWN", "30"))
+    EVENT_CLIP_WIDTH   = int(os.getenv("CROWD_MASTER_EVENT_WIDTH", "960"))
+    EVENT_BUFFER_MB    = int(os.getenv("CROWD_MASTER_EVENT_BUFFER_MB", "192"))
     # Overlays are drawn at this width minimum, so a small clip's HUD is not
     # stretched by the window. 0 disables the upscale.
     HUD_MIN_WIDTH = int(os.getenv("CROWD_MASTER_HUD_MIN_WIDTH", "1280"))
@@ -239,6 +249,7 @@ class Config:
     DRIFT_LOG   = str(_data_dir / "drift_events.csv")
     ONNX_PATH   = str(_data_dir / "crowd_model.onnx")
     GATES_FILE  = str(_data_dir / "gates.json")
+    EVENTS_DIR  = str(_data_dir / "events")
 
     # ── Models ─────────────────────────────────────────────────
     # yolov8s benchmarks FASTER than yolov8n on the RTX 3050 (18.6 vs 25.0 ms
@@ -344,17 +355,24 @@ class Config:
     FORECAST_STEPS = [5, 30, 60, 300]
 
     # ── Zones ──────────────────────────────────────────────────
+    # Fractions of frame width/height: (x1, y1, x2, y2).
+    # ★ "prayer hall" and "Prayer Hall" used to sit here as separate entries
+    # differing only by case — two different rectangles that read as one name in
+    # any report. They are the rear strip and the front section, so they are
+    # named for what they are. ZoneTracker warns if a case-only clash reappears.
     ZONES = {
-        "Entrance Door": (0.17, 0.15, 0.30, 0.60),
-        "prayer hall":    (0.0,  0.7,  1.0,  1.0),
-        "Prayer Hall": (0.32,  0.1,  0.9,  0.6),
-        "Corridor B":  (0.0,  0.1,  0.1,  0.7),
-        "IMAM Membar":  (0.9,  0.1,  1.0,  0.7)
+        "Entrance Door":     (0.17, 0.15, 0.30, 0.60),
+        "Prayer Hall Rear":  (0.0,  0.7,  1.0,  1.0),
+        "Prayer Hall Front": (0.32, 0.1,  0.9,  0.6),
+        "Corridor B":        (0.0,  0.1,  0.1,  0.7),
+        "Imam Minbar":       (0.9,  0.1,  1.0,  0.7),
     }
 
     # ── Anomaly ────────────────────────────────────────────────
-    SPEED_THRESH        = 30.0
-    DENSITY_JUMP_THRESH = 8
+    # Tunable per site: a busy doorway and a quiet prayer hall need different
+    # sensitivities, and there was no way to adjust either without editing code.
+    SPEED_THRESH        = float(os.getenv("CROWD_MASTER_SPEED_THRESH", "30"))
+    DENSITY_JUMP_THRESH = int(os.getenv("CROWD_MASTER_DENSITY_JUMP", "8"))
 
     # ── Heatmap ────────────────────────────────────────────────
     HEATMAP_DECAY  = 0.96
@@ -997,6 +1015,9 @@ class DetectionResult:
         self.frame_id       = 0
         self.accurate_count = 0
         self.smooth_boxes: Dict[int, np.ndarray] = {}
+        # Per-zone occupancy, published so the API and the display share one
+        # source of truth instead of each recomputing it.
+        self.zone_counts: Dict[str, int] = {}
         # Downscaled grayscale of the last analysed frame. AnalyticsThread needs
         # a real image for optical-flow anomaly detection and for the brightness
         # term of drift detection; it used to be handed a constant.
@@ -2393,8 +2414,73 @@ class FeedbackLoop:
 # ══════════════════════════════════════════════════════════════
 #  CSV LOGGER
 # ══════════════════════════════════════════════════════════════
+class ZoneTracker:
+    """Per-zone occupancy: current counts, and the history a report needs.
+
+    ★ NEW. Zone counts were computed in the display loop, drawn on screen, and
+    then thrown away — nothing reached the CSV, the report or the API. For a
+    site with named areas (a door, a hall, a corridor) the interesting question
+    is not "how many people are in frame" but "how full was the hall at 18:30",
+    and that could not be answered afterwards at all.
+    """
+
+    def __init__(self, zones: Dict[str, Tuple[float, float, float, float]]):
+        self.zones  = dict(zones)
+        self.names  = list(self.zones)
+        self.counts = {n: 0 for n in self.names}
+        self._by_sec: Dict[str, Dict[int, List[int]]] = {n: defaultdict(list)
+                                                         for n in self.names}
+        self.peak   = {n: 0 for n in self.names}
+
+        # A case-only difference between two zone names is almost always a typo,
+        # and it produces two independently-counted areas that read as one.
+        seen: Dict[str, str] = {}
+        for n in self.names:
+            k = n.strip().lower()
+            if k in seen:
+                logger.warning(
+                    "Zones %r and %r differ only by case — they are counted "
+                    "separately and will be hard to tell apart in reports.",
+                    seen[k], n)
+            seen[k] = n
+
+    def update(self, boxes, frame_w: int, frame_h: int) -> Dict[str, int]:
+        counts = {n: 0 for n in self.names}
+        if boxes is not None and len(boxes) > 0 and frame_w > 0 and frame_h > 0:
+            for box in boxes:
+                cx = (box[0] + box[2]) / 2.0 / frame_w
+                cy = (box[1] + box[3]) / 2.0 / frame_h
+                for name, (x1, y1, x2, y2) in self.zones.items():
+                    if x1 <= cx <= x2 and y1 <= cy <= y2:
+                        counts[name] += 1
+        self.counts = counts
+        return counts
+
+    def record(self, sec: int) -> None:
+        """Bucket the current counts by session second, for the report."""
+        for n, v in self.counts.items():
+            self._by_sec[n][sec].append(v)
+            if v > self.peak[n]:
+                self.peak[n] = v
+
+    def summary(self) -> List[Tuple[str, int, float, int]]:
+        """(zone, peak, mean, busiest_second) — mean over seconds, not samples,
+        so a second that happened to be sampled more often does not dominate."""
+        out = []
+        for n in self.names:
+            per_sec = {s: (sum(v) / len(v)) for s, v in self._by_sec[n].items() if v}
+            if not per_sec:
+                out.append((n, 0, 0.0, 0))
+                continue
+            busiest = max(per_sec, key=lambda s: per_sec[s])
+            out.append((n, self.peak[n],
+                        sum(per_sec.values()) / len(per_sec), busiest))
+        return out
+
+
 class CSVLogger:
-    def __init__(self, path: str):
+    def __init__(self, path: str, zone_names: Optional[List[str]] = None):
+        self.zone_names = list(zone_names or [])
         exists = os.path.exists(path)
         self._file   = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file)
@@ -2405,7 +2491,11 @@ class CSVLogger:
                 "p5", "p30", "p60", "p300",
                 "drift", "anomaly", "anom_score",
                 "thr", "conf", "loss", "ms",
-            ])
+            ] + [f"zone_{self._slug(n)}" for n in self.zone_names])
+
+    @staticmethod
+    def _slug(name: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_").lower() or "zone"
 
     def write(self, row):
         self._writer.writerow(row)
@@ -2431,7 +2521,8 @@ class PeakTimeTracker:
 
     def build_report(self, threshold: int, report_path: str,
                      session_stats: dict, cfg: Config,
-                     gate_mgr: GateManager):
+                     gate_mgr: GateManager,
+                     zone_track: Optional["ZoneTracker"] = None):
         if not self.sc:
             return
 
@@ -2467,6 +2558,16 @@ class PeakTimeTracker:
             lines.append(f"  TOTAL Exit  : {gate_mgr.total_exit}")
             lines.append(f"  Net inside  : {gate_mgr.total_entry - gate_mgr.total_exit:+d}")
             lines.append("")
+
+        if zone_track is not None:
+            rows = zone_track.summary()
+            if any(peak or mean for _n, peak, mean, _b in rows):
+                lines.append("── ZONE OCCUPANCY ───────────────────────────────────────────")
+                lines.append(f"  {'Zone':<22}{'Peak':>7}{'Average':>10}   Busiest at")
+                for name, peak, mean, busiest in rows:
+                    lines.append(f"  {name[:22]:<22}{peak:>7}{mean:>10.1f}   "
+                                 f"{str(timedelta(seconds=busiest))}")
+                lines.append("")
 
         lines.append("── SESSION PERFORMANCE ────────────────────────────────────────")
         lines.append(f"  Frames processed  : {session_stats.get('frames', 0)}")
@@ -2576,7 +2677,9 @@ class AnalyticsThread(threading.Thread):
                  csv_log: CSVLogger,
                  peak_track: PeakTimeTracker,
                  gate_mgr: GateManager,
-                 cfg: Config, fps: float):
+                 cfg: Config, fps: float,
+                 zone_track: Optional["ZoneTracker"] = None,
+                 frame_size: Tuple[int, int] = (0, 0)):
         super().__init__(name="Analytics", daemon=True)
         self.result      = result
         self.drift_det   = drift_det
@@ -2589,6 +2692,8 @@ class AnalyticsThread(threading.Thread):
         self.gate_mgr    = gate_mgr
         self.cfg         = cfg
         self.fps         = fps
+        self.zone_track  = zone_track
+        self.frame_w, self.frame_h = frame_size
         self._stop       = threading.Event()
         self._last_fid   = -1
         self._infer_hist = deque(maxlen=100)
@@ -2620,6 +2725,12 @@ class AnalyticsThread(threading.Thread):
             sec    = int((snap.frame_id or 0) / max(self.fps, 1))
             self.peak_track.update(sec, count)
 
+            zone_counts = {}
+            if self.zone_track is not None:
+                zone_counts = self.zone_track.update(
+                    snap.body_boxes, self.frame_w, self.frame_h)
+                self.zone_track.record(sec)
+
             if snap.inference_ms:
                 self._infer_hist.append(snap.inference_ms)
             if snap.display_fps:
@@ -2650,7 +2761,7 @@ class AnalyticsThread(threading.Thread):
                     f"{snap.adaptive_conf:.3f}",
                     f"{snap.online_loss:.4f}",
                     f"{snap.inference_ms:.1f}",
-                ])
+                ] + [zone_counts.get(n, 0) for n in self.csv_log.zone_names])
 
             self.result.update(
                 forecasts     = forecasts,
@@ -2661,6 +2772,7 @@ class AnalyticsThread(threading.Thread):
                 drift_score   = self.drift_det.drift_score,
                 mae_cnn       = self.feedback.mae_cnn,
                 mae_lstm      = self.feedback.mae_lstm,
+                zone_counts   = zone_counts,
             )
 
     def avg_infer_ms(self) -> float:
@@ -2746,6 +2858,158 @@ class AutoRetrainer(threading.Thread):
 
 # ══════════════════════════════════════════════════════════════
 #  CROWD HEATMAP
+class EventRecorder(threading.Thread):
+    """Saves a short clip around each anomaly, with the seconds leading up to it.
+
+    ★ NEW. An anomaly used to produce one line of text in a CSV and nothing
+    else, so an alert said "something happened" with no way to check what. The
+    footage is the whole point of an alert on a camera system.
+
+    Frames are held in a ring buffer, so when a trigger fires the clip starts
+    PRE_SEC *before* it. Encoding happens on this thread; the display loop only
+    ever hands over a frame reference.
+
+    Memory is the thing to watch: five seconds of 1080p is about 780 MB. Frames
+    are downscaled to CLIP_WIDTH before buffering and the buffer is capped by
+    total bytes as well as by frame count, so the footprint stays bounded no
+    matter what resolution the camera produces.
+    """
+
+    def __init__(self, out_dir: str, fps: float, cfg: Config):
+        super().__init__(name="EventRecorder", daemon=True)
+        self.cfg      = cfg
+        self.fps      = max(1.0, min(float(fps), 60.0))
+        self.out_dir  = Path(out_dir)
+        self.pre_sec  = float(getattr(cfg, "EVENT_PRE_SEC", 5.0))
+        self.post_sec = float(getattr(cfg, "EVENT_POST_SEC", 5.0))
+        self.cooldown = float(getattr(cfg, "EVENT_COOLDOWN_SEC", 30.0))
+        self.width    = int(getattr(cfg, "EVENT_CLIP_WIDTH", 960))
+        self.max_bytes = int(getattr(cfg, "EVENT_BUFFER_MB", 192)) * 1024 * 1024
+
+        self._ring: deque = deque()
+        self._bytes = 0
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._jobs: queue.Queue = queue.Queue(maxsize=4)
+        self._last_trigger = 0.0
+        self._tail: Optional[list] = None
+        self._pre_len = 0
+        self.saved = 0
+
+        self._index = self.out_dir / "events.csv"
+        self._index_ready = False
+
+    # ── called from the display loop ─────────────────────────
+    def offer(self, frame: np.ndarray) -> None:
+        """Hand over the newest frame. Cheap: one resize at most."""
+        if frame is None:
+            return
+        if frame.shape[1] > self.width:
+            scale = self.width / frame.shape[1]
+            frame = cv2.resize(frame, (self.width,
+                                       int(round(frame.shape[0] * scale))),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            frame = frame.copy()
+        nbytes = frame.nbytes
+        with self._lock:
+            if self._tail is not None:
+                self._tail.append(frame)
+                # Count only the frames captured AFTER the trigger. The tail
+                # starts out holding the pre-roll, so comparing its total length
+                # against the post-roll target ended the clip immediately.
+                if len(self._tail) - self._pre_len >= int(self.post_sec * self.fps):
+                    tail, self._tail = self._tail, None
+                    self._submit(tail)
+                return
+            self._ring.append(frame)
+            self._bytes += nbytes
+            limit = int(self.pre_sec * self.fps)
+            while self._ring and (len(self._ring) > limit
+                                  or self._bytes > self.max_bytes):
+                self._bytes -= self._ring.popleft().nbytes
+
+    def trigger(self, label: str) -> bool:
+        """Start capturing. Returns False while cooling down."""
+        now = time.monotonic()
+        if now - self._last_trigger < self.cooldown:
+            return False
+        with self._lock:
+            if self._tail is not None:
+                return False
+            self._last_trigger = now
+            self._label = label
+            self._tail = list(self._ring)      # pre-roll
+            self._pre_len = len(self._tail)
+        logger.info(f"Event clip: recording '{label}'")
+        return True
+
+    # ── recorder thread ──────────────────────────────────────
+    def _submit(self, frames: list) -> None:
+        try:
+            self._jobs.put_nowait((getattr(self, "_label", "event"), frames))
+        except queue.Full:
+            logger.warning("Event clip dropped — writer is behind")
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                label, frames = self._jobs.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._write(label, frames)
+            except Exception as e:
+                logger.warning(f"Event clip failed: {e}")
+
+    def _write(self, label: str, frames: list) -> None:
+        if not frames:
+            return
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = re.sub(r"[^0-9a-zA-Z]+", "_", label).strip("_").lower() or "event"
+        path = self.out_dir / f"{stamp}_{slug}.mp4"
+        h, w = frames[0].shape[:2]
+        vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             self.fps, (w, h))
+        if not vw.isOpened():
+            logger.warning(f"Event clip: cannot open writer for {path}")
+            return
+        for f in frames:
+            vw.write(f)
+        vw.release()
+        self.saved += 1
+
+        if not self._index_ready:
+            new = not self._index.exists()
+            self._index_ready = True
+            if new:
+                with open(self._index, "w", newline="", encoding="utf-8") as fh:
+                    csv.writer(fh).writerow(
+                        ["timestamp", "event", "seconds", "file"])
+        with open(self._index, "a", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), label,
+                f"{len(frames) / self.fps:.1f}", path.name])
+        logger.info(f"Event clip saved: {path.name} "
+                    f"({len(frames) / self.fps:.1f}s)")
+
+    def stop(self) -> None:
+        # Flush whatever has been captured so far rather than losing it.
+        with self._lock:
+            if self._tail:
+                self._submit(self._tail)
+                self._tail = None
+        # Wait for the queue to drain AND for the writer to finish the job it is
+        # on, otherwise the session summary reports one fewer clip than exists.
+        deadline = time.time() + 5.0
+        while not self._jobs.empty() and time.time() < deadline:
+            time.sleep(0.05)
+        self._stop.set()
+        if self.is_alive():
+            self.join(timeout=max(0.5, deadline - time.time()))
+
+
 # ══════════════════════════════════════════════════════════════
 class CrowdHeatmap:
     def __init__(self, w: int, h: int, decay: float = 0.96, radius: int = 45):
@@ -2888,6 +3152,7 @@ def start_api(result: DetectionResult, gate_mgr: GateManager, cfg: Config):
                 "gate_exit":     gate_mgr.total_exit,
                 "gates":         [{"id":g.gate_id,"entry":g.entry,"exit":g.exit}
                                    for g in gate_mgr.gates],
+                "zones":         s.zone_counts,
                 "status":        s.status,
                 "crowd_thr":     s.crowd_thr,
                 "forecasts":     s.forecasts,
@@ -3894,7 +4159,8 @@ def run(cfg: Config):
     anomaly_det = DeepAnomalyDetector(cfg.SPEED_THRESH, cfg.DENSITY_JUMP_THRESH)
     adapt_thr   = AdaptiveThreshold(cfg.CROWD_THRESHOLD, cfg.CROWD_THRESHOLD + 10)
     feedback    = FeedbackLoop()
-    csv_log     = CSVLogger(cfg.LOG_FILE)
+    zone_track  = ZoneTracker(cfg.ZONES)
+    csv_log     = CSVLogger(cfg.LOG_FILE, zone_track.names)
     peak_track  = PeakTimeTracker()
     retrainer   = AutoRetrainer(cnn_model, buffer, cfg, model_lock)
     if online_on:
@@ -3957,6 +4223,13 @@ def run(cfg: Config):
     result.forecasts = {5:0, 30:0, 60:0, 300:0}
     result.anomalies = []
 
+    recorder: Optional[EventRecorder] = None
+    if cfg.EVENT_CLIPS:
+        recorder = EventRecorder(cfg.EVENTS_DIR, fps, cfg)
+        recorder.start()
+        logger.info(f"Event clips: on ({cfg.EVENT_PRE_SEC:.0f}s before + "
+                    f"{cfg.EVENT_POST_SEC:.0f}s after) -> {cfg.EVENTS_DIR}")
+
     loader.step("Starting Detection Worker...")
     det_worker = DetectionWorker(
         player.detect_queue, result,
@@ -3972,6 +4245,7 @@ def run(cfg: Config):
         result, drift_det, forecaster, anomaly_det,
         adapt_thr, feedback, csv_log, peak_track,
         gate_mgr, cfg, fps,
+        zone_track=zone_track, frame_size=(frame_w, frame_h),
     )
     analytics.start()
 
@@ -4049,16 +4323,19 @@ def run(cfg: Config):
 
         snap = result.snapshot()
 
-        # ★ FIX: this reset was inside the `len(boxes) > 0` guard, so when the
-        # scene emptied the zone overlay kept displaying the last non-zero counts.
-        zone_counts = {z: 0 for z in cfg.ZONES}
-        if snap.body_boxes is not None and len(snap.body_boxes) > 0:
-            for box in snap.body_boxes:
-                cx = (box[0]+box[2])/2/frame_w
-                cy = (box[1]+box[3])/2/frame_h
-                for name,(x1,y1,x2,y2) in cfg.ZONES.items():
-                    if x1 <= cx <= x2 and y1 <= cy <= y2:
-                        zone_counts[name] += 1
+        if recorder is not None:
+            if got_new:
+                recorder.offer(raw)
+            # One clip per burst: the recorder enforces its own cooldown, so a
+            # sustained anomaly does not produce a clip per frame.
+            if snap.anomalies:
+                recorder.trigger(snap.anomalies[0])
+
+        # Zone occupancy is computed once by the analytics thread (which also
+        # logs it) and read from the snapshot here, so the overlay and the CSV
+        # can never disagree. It used to be recomputed in this loop and never
+        # recorded anywhere.
+        zone_counts = snap.zone_counts or {z: 0 for z in cfg.ZONES}
 
         display = raw.copy()
 
@@ -4185,8 +4462,13 @@ def run(cfg: Config):
                 pass
 
         elif key == ord("g"):
-            disp_scale = pz.zoom if pz.zoom != 1.0 else 1.0
-            gate_mgr.toggle_draw_mode(WIN_NAME, disp_scale)
+            # ★ FIX: mouse coordinates arrive in the coordinate space of the
+            # image handed to imshow, which is now the HUD upscale (vs) on top
+            # of any pan/zoom. Passing only pz.zoom placed every drawn gate at
+            # vs times its true position — on a 640-wide clip upscaled to 1280
+            # that put gates at x>1000 in a frame 640 px wide, so they could
+            # never be crossed.
+            gate_mgr.toggle_draw_mode(WIN_NAME, vs * pz.zoom)
 
         elif key == 9:  # TAB
             gate_mgr.select_next()
@@ -4327,6 +4609,8 @@ def run(cfg: Config):
     analytics.stop()
     retrainer.stop()
     learner.stop()
+    if recorder is not None:
+        recorder.stop()
     drift_det.close()
     csv_log.close()
     # ★ FIX: the model and buffer used to be written out unconditionally on every
@@ -4348,10 +4632,11 @@ def run(cfg: Config):
         "mae_lstm":     feedback.mae_lstm,
         "avg_infer_ms": det_worker.avg_infer_ms(),
         "display_fps":  analytics.avg_display_fps(),
+        "event_clips":  recorder.saved if recorder is not None else 0,
     }
 
     peak_track.build_report(cfg.CROWD_THRESHOLD, cfg.REPORT_FILE,
-                            session_stats, cfg, gate_mgr)
+                            session_stats, cfg, gate_mgr, zone_track)
     generate_pdf_report(peak_track, cfg, session_stats, gate_mgr)
 
     print("\n" + "="*58)
