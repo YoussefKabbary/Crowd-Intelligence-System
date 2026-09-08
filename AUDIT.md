@@ -20,7 +20,8 @@ Full report: <https://claude.ai/code/artifact/ecab8e47-47ed-4332-8281-c561e5a083
 | Anomaly score | always `0.000` | **live** |
 | Forecast horizons | all identical | **distinct** |
 | CSV cadence | gaps of 2–21 s | **even 2 s** |
-| Gate counting (3 people) | 0 counted | **3 of 3, both modes** |
+| Gate counting, sequential | 0 counted | **3 of 3, both modes** |
+| Gate counting, simultaneous | 0 counted | 2-3 of 3 — see below |
 
 ---
 
@@ -214,10 +215,21 @@ Deliberately not done, and why:
   MAE against. That needs ~200 hand-counted frames from your own cameras — a
   data task, not a code task, and the one thing that would let you tell whether
   a future change helps or hurts accuracy.
-- **Gate accuracy on real crowds.** The test covers people crossing one at a
-  time, well separated. Dense two-way flow through a doorway, where people
-  occlude each other on the line, is not covered and is where ID-based counting
-  is hardest.
+- **Gate accuracy in dense flow — measured, and it is the real limit.** The
+  suite now runs the crowded case and prints the result instead of asserting on
+  it. With three walkers crossing together at the same speed, ByteTrack swaps
+  their IDs: a trace showed one ID credited with two crossings while a third
+  walker was never counted, and a single ID's reported x jumping 375 px between
+  consecutive frames. BoT-SORT behaves the same. Turning cuDNN autotuning off
+  was enough to flip the total between 2 and 3 — and the run that produced 3 was
+  right only by cancellation, not because it counted correctly.
+
+  So the honest statement is: gate counting is dependable when people cross one
+  at a time or clearly separated, and is not dependable for dense simultaneous
+  flow. Closing that gap needs appearance-based re-identification, not threshold
+  tuning. Until then the asserted tests cover what the system can actually
+  guarantee, and the crowded case is reported so a regression there is visible
+  without failing the suite for unrelated reasons.
 - **Head detection via a full pose model.** Running `yolov8s-pose` purely to get
   head centres costs ~17–34 ms/frame. Deriving the head from the upper part of
   the body box, or training a dedicated head detector, would reclaim most of it.

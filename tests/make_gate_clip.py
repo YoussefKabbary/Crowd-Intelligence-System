@@ -50,7 +50,19 @@ def _person_crop(model=None) -> np.ndarray:
 
 
 def build(out_path: str, n_people: int = 3, w: int = 1280, h: int = 720,
-          fps: int = 25, frames: int = 170, verify: bool = True) -> None:
+          fps: int = 25, frames: int = 170, verify: bool = True,
+          sequential: bool = False) -> None:
+    """Render the clip.
+
+    sequential=False packs the walkers 34 frames apart while each takes about 90
+    frames to cross, so all of them share the frame, moving at the same speed in
+    the same direction. That is close to the worst case for a motion-only
+    tracker: it cannot tell them apart and swaps their IDs, which makes an exact
+    gate count impossible. Worth measuring, not fair to assert on.
+
+    sequential=True lets each walker finish before the next appears, so identity
+    is unambiguous and the resulting count is a property of the gate logic alone.
+    """
     from ultralytics import YOLO
     model  = YOLO(str(ROOT / "yolov8s.pt"))
     bg     = _background(w, h)
@@ -79,8 +91,13 @@ def build(out_path: str, n_people: int = 3, w: int = 1280, h: int = 720,
 
     vw = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
     baseline = int(h * 0.78) + 60
-    stride = 34                       # frames between successive walkers
-    span   = frames - stride * (n_people - 1) - 10
+    if sequential:
+        # One at a time, with a gap, so no two are ever on screen together.
+        span   = max(24, frames // max(n_people, 1) - 8)
+        stride = span + 6
+    else:
+        stride = 34                   # frames between successive walkers
+        span   = frames - stride * (n_people - 1) - 10
     for f in range(frames):
         canvas = bg.copy()
         for i in range(n_people):
