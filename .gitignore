@@ -3,11 +3,15 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Model weights (large, re-downloadable from ultralytics)
+# Model weights — downloaded by ultralytics on first run, not source
 *.pt
 *.onnx
 
-# Runtime data / generated artifacts
+# Trained checkpoints. The CNN regressor is off by default and its checkpoint
+# is a per-deployment artifact, not something to ship.
+*.pth
+
+# Runtime data and generated artifacts
 DATA/replay_buffer.pkl
 DATA/*.log
 DATA/crowd_log.csv
@@ -15,6 +19,10 @@ DATA/drift_events.csv
 DATA/crowd_report.*
 DATA/crowd_report_report.png
 DATA/snapshots/
+DATA/events/
+
+# Labelled frames produced by tools/extract_frames.py
+*_labels/
 
 # Local scratch
 install_torch.txt

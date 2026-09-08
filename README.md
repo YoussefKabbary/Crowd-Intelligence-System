@@ -1,10 +1,45 @@
 # Crowd Master
 
 Real-time crowd analytics for video files and live cameras: person detection and
-tracking, gate (door) entry/exit counting, zone occupancy, heatmaps, anomaly
-alerts, and a per-session PDF/CSV report.
+tracking, gate (door) entry/exit counting, per-zone occupancy, heatmaps, anomaly
+alerts with saved video clips, and a per-session PDF/CSV report.
 
-Built on YOLOv8 (detection + pose) with ByteTrack, PyTorch, and OpenCV.
+Built on YOLOv8 (detection + pose) with ByteTrack, PyTorch and OpenCV. Runs at
+roughly 20 detections/second on a laptop RTX 3050 at 960x540.
+
+![Crowd Master running](docs/screenshot.jpg)
+
+## What it does
+
+- **Counts people** per frame, fusing body detections with pose-derived head
+  positions.
+- **Counts through gates.** Draw a line on the video; crossings are tallied by
+  direction. Reliable for people crossing one at a time — see
+  [the limits](#what-gate-counting-can-and-cannot-do).
+- **Tracks named zones** (a doorway, a hall, a corridor) and records peak and
+  average occupancy for each, so "how full was the hall at 18:30" is answerable
+  after the fact.
+- **Flags anomalies** — density surges, rapid evacuation, running — from optical
+  flow and count dynamics, and saves a video clip either side of each one.
+- **Forecasts** occupancy 5 s to 5 min ahead from a robust trend fit.
+- **Serves it live** over a small REST API, and writes a session report as
+  TXT/PDF plus a CSV time series.
+
+## Honest limits
+
+This project keeps its measurements in the open, including the unflattering
+ones. Two worth knowing before you rely on it:
+
+- **Gate counting depends on tracker identity.** It is dependable for people
+  crossing one at a time and not dependable for dense two-way flow through a
+  wide opening. Measured and explained
+  [below](#what-gate-counting-can-and-cannot-do).
+- **Detection accuracy is unmeasured on real footage.** Every published number
+  here is a speed measurement. There is a harness for measuring accuracy
+  ([below](#measuring-accuracy)) but it needs frames you have counted by hand.
+
+`AUDIT.md` records a full code review with the defects found, how each was
+measured, and what remains outstanding.
 
 ---
 
@@ -226,7 +261,22 @@ Everything lands in `DATA/` (or `CROWD_MASTER_DATA_DIR`):
 | `events/*.mp4` | clips saved around anomalies |
 | `events/events.csv` | index of those clips |
 
+## Project layout
+
+| Path | What it is |
+|---|---|
+| `crowd_master_v2.py` | the whole application |
+| `tests/test_gate_counting.py` | gate-counting regression test |
+| `tests/measure_accuracy.py` | accuracy against hand-counted frames |
+| `tools/extract_frames.py` | pulls frames out for hand-counting |
+| `AUDIT.md` | code review: defects, measurements, what is outstanding |
+
 ## Notes
 
-See `AUDIT.md` for the 2026-09-04 code review: what was broken, how it was
-measured, and what is still outstanding.
+`AUDIT.md` records the 2026-09-04 review — what was broken, how each finding was
+measured, and what is still open. Several fixes in it came from writing the
+tests rather than from reading the code.
+
+## License
+
+MIT — see `LICENSE`.
