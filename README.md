@@ -1,57 +1,110 @@
-# Crowd Master
+<h1 align="center">Crowd Master</h1>
 
-Real-time crowd analytics for video files and live cameras: person detection and
-tracking, gate (door) entry/exit counting, per-zone occupancy, heatmaps, anomaly
-alerts with saved video clips, and a per-session PDF/CSV report.
+<p align="center">
+  <b>Real-time crowd analytics for CCTV</b><br>
+  Detection · tracking · doorway counting · zone occupancy · anomaly clips · forecasting
+</p>
 
-Built on YOLOv8 (detection + pose) with ByteTrack, PyTorch and OpenCV. Runs at
-roughly 20 detections/second on a laptop RTX 3050 at 960x540.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/YOLOv8-ultralytics-7B4AE2?style=flat-square" alt="YOLOv8">
+  <img src="https://img.shields.io/badge/PyTorch-CUDA%20%7C%20CPU-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/OpenCV-realtime-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="OpenCV">
+  <img src="https://img.shields.io/badge/license-MIT-1F883D?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/version-2.0.0-0969DA?style=flat-square" alt="v2.0.0">
+</p>
 
-![Crowd Master running](docs/screenshot.jpg)
+<p align="center">
+  <img src="docs/demo.gif" alt="Crowd Master running: detection, gate counting, zone occupancy and heatmap" width="820">
+</p>
+
+<p align="center">
+  <sub>One pass over real CCTV footage. Every number on screen is produced live by the pipeline.</sub>
+</p>
+
+---
+
+<table>
+<tr>
+<td width="25%" align="center"><h3>43–72 ms</h3><sub>per frame<br>laptop RTX 3050</sub></td>
+<td width="25%" align="center"><h3>~20 /s</h3><sub>detections<br>960×540, FP16</sub></td>
+<td width="25%" align="center"><h3>11 s</h3><sub>launch to first<br>detection</sub></td>
+<td width="25%" align="center"><h3>28</h3><sub>defects found,<br>documented, fixed</sub></td>
+</tr>
+</table>
+
+Every figure above was measured on the hardware named beside it, not estimated.
+`AUDIT.md` records how each one was reproduced.
+
+---
 
 ## What it does
 
-- **Counts people** per frame, fusing body detections with pose-derived head
-  positions.
-- **Counts through gates.** Draw a line on the video; crossings are tallied by
-  direction. Reliable for people crossing one at a time — see
-  [the limits](#what-gate-counting-can-and-cannot-do).
-- **Tracks named zones** (a doorway, a hall, a corridor) and records peak and
-  average occupancy for each, so "how full was the hall at 18:30" is answerable
-  after the fact.
-- **Flags anomalies** — density surges, rapid evacuation, running — from optical
-  flow and count dynamics, and saves a video clip either side of each one.
-- **Forecasts** occupancy 5 s to 5 min ahead from a robust trend fit.
-- **Serves it live** over a small REST API, and writes a session report as
-  TXT/PDF plus a CSV time series.
+| | |
+|---|---|
+| **Counts people** | Body detection fused with pose-derived head positions, so partly occluded people still register. |
+| **Counts through doorways** | Draw a line on the video; crossings are tallied by direction and saved between runs. |
+| **Tracks named zones** | Peak, average and busiest moment per area — written to CSV and the session report, so "how full was the hall at 18:30" is answerable afterwards. |
+| **Flags anomalies** | Density surges, rapid evacuation and unusual motion from optical flow, **with the surrounding video clip saved automatically**. |
+| **Forecasts occupancy** | 5 s to 5 min ahead from a robust trend fit over a 1 Hz history. |
+| **Serves it live** | Small REST API, plus a TXT/PDF session report and a CSV time series. |
+| **Runs anywhere** | Video file, webcam or RTSP camera. Windowed or fully headless for batch jobs. |
 
-## Version
+<details>
+<summary><b>Architecture</b></summary>
 
-**v2** — the system audited, measured and fixed. Every performance figure here
-was measured on the hardware named beside it; `AUDIT.md` records what was broken
-and how each finding was reproduced.
+```
+             ┌──────────────────┐
+  camera ───▶│ VideoPlayer      │  exact-FPS playback, independent of detection
+  or file    └────────┬─────────┘
+                      │
+             ┌────────▼─────────┐
+             │ DetectionWorker  │  YOLOv8 body + pose, ByteTrack, fusion,
+             │                  │  gate crossings, optional sliced inference
+             └────────┬─────────┘
+                      │  shared snapshot
+       ┌──────────────┼──────────────┐
+       │              │              │
+┌──────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
+│ Analytics   │ │ Event      │ │ Main thread│
+│ zones,      │ │ Recorder   │ │ HUD only,  │
+│ forecast,   │ │ pre/post   │ │ never
+│ anomaly,CSV │ │ roll clips │ │ blocks     │
+└─────────────┘ └────────────┘ └────────────┘
+```
 
-**v3, in progress** — watchlist identity matching (face / appearance
-re-identification / gait), gated on whether a camera's pixels actually support
-the method. Held back from this release deliberately: it is written but not yet
-verified against a measured false-accept rate, and it is not shipping until it
-is. Work in progress on the `phase3-identity` branch.
+The display thread only draws. Detection running slowly makes the overlay lag
+behind the video; it never freezes the window.
+</details>
+
+---
 
 ## Honest limits
 
-This project keeps its measurements in the open, including the unflattering
-ones. Two worth knowing before you rely on it:
+This project keeps its measurements in the open, including the unflattering ones.
 
-- **Gate counting depends on tracker identity.** It is dependable for people
-  crossing one at a time and not dependable for dense two-way flow through a
-  wide opening. Measured and explained
-  [below](#what-gate-counting-can-and-cannot-do).
-- **Detection accuracy is unmeasured on real footage.** Every published number
-  here is a speed measurement. There is a harness for measuring accuracy
-  ([below](#measuring-accuracy)) but it needs frames you have counted by hand.
+> **Gate counting depends on tracker identity.** It is dependable when people
+> cross one at a time or clearly separated — a doorway, a turnstile, a corridor.
+> It is **not** dependable for dense two-way flow through a wide opening, because
+> the count is only as good as the tracker's ability to keep one ID on one
+> person. [Measured and explained below](#what-gate-counting-can-and-cannot-do).
 
-`AUDIT.md` records a full code review with the defects found, how each was
-measured, and what remains outstanding.
+> **Detection accuracy on real footage is unmeasured.** Every published figure
+> here is a speed measurement. There is a harness for measuring accuracy
+> ([below](#measuring-accuracy)); it needs frames counted by hand, and those do
+> not exist yet.
+
+## Version
+
+**v2** — the system audited, measured and fixed. `AUDIT.md` records what was
+broken, how each finding was reproduced, and what remains open. A few of those
+findings came from writing the tests rather than from reading the code.
+
+**v3, in progress** — watchlist identity matching (face / appearance
+re-identification / gait), gated on whether a camera's pixels actually support
+the method. Held back deliberately: it is written but not yet verified against a
+measured false-accept rate, and it does not ship until it is. On the
+`phase3-identity` branch.
 
 ---
 
