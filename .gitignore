@@ -29,3 +29,4 @@ install_torch.txt
 *.mp4
 v1_reference/
 DATA/_demo/
+HANDOFF.md
