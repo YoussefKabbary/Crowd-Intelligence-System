@@ -27,3 +27,4 @@ DATA/events/
 # Local scratch
 install_torch.txt
 *.mp4
+v1_reference/
