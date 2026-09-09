@@ -25,6 +25,18 @@ roughly 20 detections/second on a laptop RTX 3050 at 960x540.
 - **Serves it live** over a small REST API, and writes a session report as
   TXT/PDF plus a CSV time series.
 
+## Version
+
+**v2** — the system audited, measured and fixed. Every performance figure here
+was measured on the hardware named beside it; `AUDIT.md` records what was broken
+and how each finding was reproduced.
+
+**v3, in progress** — watchlist identity matching (face / appearance
+re-identification / gait), gated on whether a camera's pixels actually support
+the method. Held back from this release deliberately: it is written but not yet
+verified against a measured false-accept rate, and it is not shipping until it
+is. Work in progress on the `phase3-identity` branch.
+
 ## Honest limits
 
 This project keeps its measurements in the open, including the unflattering

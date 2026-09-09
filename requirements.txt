@@ -27,12 +27,3 @@ reportlab==5.0.0
 # onnx + onnxruntime   enable the E key (ONNX export of the CNN regressor)
 # ffmpeg on PATH       enables audio playback (the app looks for ffplay)
 #                      winget install ffmpeg
-
-# --- Identity matching (identity.py) ----------------------------------------
-truststore==0.10.4       # use the OS certificate store; without it model
-                         # downloads fail behind HTTPS-inspecting antivirus
-onnxruntime==1.29.0      # runs the ReID network. Swap for onnxruntime-gpu on
-                         # CUDA — on CPU the ReID pass measured 232 ms/frame.
-# insightface            # OPTIONAL, face identification only. Not installed by
-#                        # default: face matching is the highest-consequence
-#                        # path here and should be a deliberate choice.
