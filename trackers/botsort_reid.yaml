@@ -1,0 +1,28 @@
+# BoT-SORT with appearance ReID enabled.
+#
+# Plain motion-only association (bytetrack, or botsort with with_reid off)
+# swaps IDs between people who move at the same speed in the same direction.
+# That is measurable: with three walkers crossing a line together, one ID was
+# credited with two crossings while a third walker went uncounted.
+#
+# Gate counting is identity-based, so ID stability is the thing that limits it.
+# ReID adds an appearance term to the association cost, which is exactly the
+# signal motion cannot supply.
+#
+# Costs extra compute per frame — measure before enabling on a live camera.
+tracker_type: botsort
+
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+
+gmc_method: none          # sparseOptFlow throws on OpenCV 5.0 in this project
+
+# ReID
+with_reid: True
+model: yolo26s-reid.onnx  # purpose-trained ReID network, auto-downloaded
+proximity_thresh: 0.5
+appearance_thresh: 0.8
