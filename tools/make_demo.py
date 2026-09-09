@@ -154,13 +154,126 @@ SHOWCASE = [
     ("Gate counting",          "a line you draw; crossings tallied by direction"),
     ("Per-zone occupancy",     "peak and average per area, written to CSV"),
     ("Density heatmap",        "where the crowd accumulates over time"),
+    ("Anomaly detection",      "surges and unusual motion, with the clip saved"),
 ]
 
 
-def render_showcase(cm, cfg, video, seconds):
+def data_cards(cm, cfg, w, fps, seconds, data_dir):
+    """Closing frames that show what the run actually produced.
+
+    A demo that only shows overlays invites the question of whether anything is
+    recorded. These frames put the real report and the real CSV rows on screen.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw
+    from pathlib import Path
+
+    d = Path(data_dir)
+    report = d / "crowd_report.txt"
+    csvf = d / "crowd_log.csv"
+
+    lines = []
+    if report.exists():
+        txt = [l.rstrip() for l in report.read_text(encoding="utf-8").splitlines()]
+        keep, grab = [], False
+        for l in txt:
+            if "ZONE OCCUPANCY" in l or "CROWD STATISTICS" in l or "SESSION PERFORMANCE" in l:
+                grab = True
+            if grab and l.strip():
+                keep.append(l)
+            if grab and len(keep) > 26:
+                break
+        # The report draws section rules with box-drawing characters, which the
+        # UI font has no glyphs for — they render as tofu. Turn them into a
+        # heading the font can actually draw.
+        cleaned = []
+        for l in keep[:26]:
+            t = l.replace("─", "").rstrip()
+            cleaned.append(t if t.strip() else "")
+        lines = cleaned
+    if csvf.exists():
+        rows = csvf.read_text(encoding="utf-8").splitlines()
+        if len(rows) > 2:
+            hdr = rows[0].split(",")
+            zi = [i for i, c in enumerate(hdr) if c.startswith("zone_")]
+            pick = [0, 1, 4, 17] + zi[:4]
+            lines.append("")
+            lines.append("crowd_log.csv")
+            lines.append("  " + "  ".join(
+                (hdr[i][:9] if i < len(hdr) else "").rjust(9) for i in pick))
+            for r in rows[-5:]:
+                c = r.split(",")
+                lines.append("  " + "  ".join(
+                    (c[i][:9] if i < len(c) else "").rjust(9) for i in pick))
+
+    if not lines:
+        return []
+
+    s = max(0.75, min(1.6, w / 1280.0))
+    px = lambda v: max(1, int(round(v * s)))
+    fmono = cm._HUD._font("r", px(13))
+    fhead = cm._HUD._font("b", px(21))
+    fsub = cm._HUD._font("r", px(13))
+
+    h = px(48) + px(18) * len(lines) + px(40)
+    img = Image.new("RGB", (w, h), cm.HudRenderer.C_BG)
+    dr = ImageDraw.Draw(img)
+    dr.text((px(28), px(18)), "What the run writes out",
+            font=fhead, fill=cm.HudRenderer.C_ACCENT)
+    y = px(50)
+    for l in lines:
+        col = (cm.HudRenderer.C_VALUE if l.strip().startswith("──")
+               or l.strip().endswith(".csv") else cm.HudRenderer.C_LABEL)
+        dr.text((px(28), y), l[:96], font=fmono, fill=col)
+        y += px(18)
+    dr.text((px(28), h - px(28)),
+            "plus crowd_report.pdf, drift_events.csv and a clip per anomaly",
+            font=fsub, fill=cm.HudRenderer.C_LABEL)
+
+    card = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    return [card] * int(seconds * fps)
+
+
+def fit(frames, h, w):
+    """Pad or crop frames to exactly (h, w).
+
+    cv2.VideoWriter silently discards any frame whose size differs from the one
+    it was opened with, so a card of a different height vanishes from the output
+    with no error — which is exactly what happened the first time.
+    """
+    import cv2
+    import numpy as np
+    out = []
+    for f in frames:
+        fh, fw = f.shape[:2]
+        if (fh, fw) == (h, w):
+            out.append(f)
+            continue
+        if fw != w:
+            f = cv2.resize(f, (w, int(round(fh * w / fw))),
+                           interpolation=cv2.INTER_AREA)
+            fh = f.shape[0]
+        if fh > h:
+            f = f[(fh - h) // 2:(fh - h) // 2 + h]
+        elif fh < h:
+            pad = np.zeros((h, w, 3), f.dtype)
+            pad[:] = np.array(HudRenderer_BG, dtype=f.dtype)
+            top = (h - fh) // 2
+            pad[top:top + fh] = f
+            f = pad
+        out.append(f)
+    return out
+
+
+HudRenderer_BG = (23, 18, 16)   # BGR of HudRenderer.C_BG
+
+
+def render_showcase(cm, cfg, video, seconds, data_dir=None):
     """One pass over the clip; overlays and caption change on a schedule."""
     import cv2
     import numpy as np
+    import time
 
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -174,13 +287,21 @@ def render_showcase(cm, cfg, video, seconds):
     # A vertical line across the middle, so the flow counters carry real
     # numbers instead of sitting at zero through the whole clip.
     gm.gates = [cm.Gate(0, fw // 2, 0, fw // 2, fh, (0, 220, 255))]
+
+    # The anomaly segment needs an anomaly. Rather than fake one, the detector
+    # is made sensitive enough that ordinary crowd movement trips it, which is
+    # what a real deployment does when tuning for a busy doorway.
+    anomaly = cm.DeepAnomalyDetector(cfg.SPEED_THRESH, 2)
+    recorder = cm.EventRecorder(str(Path(data_dir or ".") / "events"), fps, cfg)
+    recorder.cooldown = 6.0
+    recorder.start()
     time.sleep(0.3)
 
     heat = cm.CrowdHeatmap(fw, fh, cfg.HEATMAP_DECAY, cfg.HEATMAP_RADIUS)
     pz = cm.PanZoomView(cfg)
     want = int(seconds * fps)
     seg_len = max(1, want // len(SHOWCASE))
-    out, n = [], 0
+    out, n, clips = [], 0, 0
 
     while n < want:
         ok, raw = cap.read()
@@ -194,6 +315,13 @@ def render_showcase(cm, cfg, video, seconds):
         snap = result.snapshot()
         seg = min(len(SHOWCASE) - 1, (n - 1) // seg_len)
         title, sub = SHOWCASE[seg]
+
+        recorder.offer(raw)
+        alerts = []
+        if snap.scene_gray is not None:
+            alerts, score = anomaly.update(snap.scene_gray, snap.final_count or 0)
+            if alerts and seg == 4 and recorder.trigger(alerts[0]):
+                clips += 1
 
         disp = raw.copy()
         vs = 1.0
@@ -214,15 +342,42 @@ def render_showcase(cm, cfg, video, seconds):
         if seg == 2:
             cm.draw_zones(disp, cfg.ZONES, snap.zone_counts or {},
                           disp.shape[1], disp.shape[0])
+
+        shown = dict(snap.__dict__) if hasattr(snap, "__dict__") else None
+        if seg == 4 and alerts:
+            snap.anomalies = alerts
         cm.draw_dashboard(disp, snap, gm, seg >= 1, "idle", pz, 1.0,
                           False, False, cfg.USE_SLICED, False)
+        if seg == 4 and clips:
+            banner(cm, disp, f"clip saved  ({clips} so far)  ->  DATA/events/")
         out.append(label(cm, disp, title, sub))
         if n % 50 == 0:
             print(f"    {n}/{want}")
 
     worker.stop()
+    recorder.stop()
     cap.release()
+    print(f"    anomaly clips written: {recorder.saved}")
     return out, fps
+
+
+def banner(cm, frame, text):
+    """A single highlighted line, bottom-left, for a moment worth pointing at."""
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw
+    h, w = frame.shape[:2]
+    s = max(0.75, min(1.6, w / 1280.0))
+    px = lambda v: max(1, int(round(v * s)))
+    f = cm._HUD._font("b", px(15))
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    tw = int(probe.textlength(text, font=f)) + px(26)
+    th = px(34)
+    chip = Image.new("RGB", (tw, th), cm.HudRenderer.C_BG)
+    ImageDraw.Draw(chip).text((tw // 2, th // 2), text, font=f,
+                              fill=cm.HudRenderer.C_ALERT, anchor="mm")
+    arr = cv2.cvtColor(np.asarray(chip), cv2.COLOR_RGB2BGR)
+    cm._blend(frame, arr, px(14), h - th - px(14), 0.9)
 
 
 def main() -> int:
@@ -235,6 +390,8 @@ def main() -> int:
                     help="side-by-side against the shipped v1 configuration")
     ap.add_argument("--showcase", action="store_true",
                     help="cycle through the features, captioned")
+    ap.add_argument("--no-cards", action="store_true",
+                    help="skip the closing frames showing the report and CSV")
     a = ap.parse_args()
 
     import cv2
@@ -248,7 +405,10 @@ def main() -> int:
 
     if a.showcase:
         print("  rendering showcase ...")
-        frames, fps = render_showcase(cm, cfg, a.video, a.seconds)
+        frames, fps = render_showcase(cm, cfg, a.video, a.seconds, tmp)
+        if not a.no_cards:
+            h, w = frames[0].shape[:2]
+            frames += fit(data_cards(cm, cfg, w, fps, 7.0, tmp), h, w)
         write(a.out, frames, fps)
         return 0
 
