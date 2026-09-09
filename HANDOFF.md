@@ -28,7 +28,7 @@ Single file (`crowd_master_v2.py`, ~4,400 lines) plus `identity.py`, `tests/`,
 |---|---|
 | 1 — critical audit fixes | done, committed |
 | 2 — zones, accuracy harness, event clips | done, committed |
-| 3 — identity matching | `identity.py` written and unit-tested; **not wired in** |
+| 3 — identity matching | on branch `phase3-identity`, **not in the v2 release** |
 | Publishing | prepared, **not pushed** |
 
 Runs clean: 999 frames, 42.6 ms/frame, no exceptions.
@@ -192,8 +192,14 @@ All configuration is environment variables — see README.
 
 ### Phase 3 — identity matching
 
-`identity.py` is written, compiles, and its capability gate is verified. Not
-wired into the pipeline yet.
+`identity.py` is written, compiles, and its capability gate is verified. It
+lives on the `phase3-identity` branch and is deliberately not part of the v2
+release: it is not yet verified against a measured false-accept rate, and it
+should not ship until it is.
+
+```bash
+git checkout phase3-identity
+```
 
 3. Wire `IdentityEngine` into `DetectionWorker`: measure capability per tracked
    person, call `check()`, surface candidates in the HUD and `/api/status`.
