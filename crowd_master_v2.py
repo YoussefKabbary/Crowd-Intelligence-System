@@ -360,12 +360,23 @@ class Config:
     # differing only by case — two different rectangles that read as one name in
     # any report. They are the rear strip and the front section, so they are
     # named for what they are. ZoneTracker warns if a case-only clash reappears.
+    # Generic by default because the rectangles are meaningless until someone
+    # sets them for their own camera — these are a starting shape, not a layout.
+    # Name them after what is actually in view; the names appear in the CSV
+    # columns and the session report, so they are what a reader sees later.
+    #
+    # For a prayer hall, for instance:
+    #     "Entrance":    (0.17, 0.15, 0.30, 0.60)
+    #     "Hall Front":  (0.32, 0.10, 0.90, 0.60)
+    #     "Hall Rear":   (0.00, 0.70, 1.00, 1.00)
+    #     "Side Aisle":  (0.00, 0.10, 0.10, 0.70)
+    #     "Minbar":      (0.90, 0.10, 1.00, 0.70)
     ZONES = {
-        "Entrance Door":     (0.17, 0.15, 0.30, 0.60),
-        "Prayer Hall Rear":  (0.0,  0.7,  1.0,  1.0),
-        "Prayer Hall Front": (0.32, 0.1,  0.9,  0.6),
-        "Corridor B":        (0.0,  0.1,  0.1,  0.7),
-        "Imam Minbar":       (0.9,  0.1,  1.0,  0.7),
+        "Entrance":    (0.17, 0.15, 0.30, 0.60),
+        "Main Area":   (0.32, 0.10, 0.90, 0.60),
+        "Far End":     (0.00, 0.70, 1.00, 1.00),
+        "Left Aisle":  (0.00, 0.10, 0.10, 0.70),
+        "Right Aisle": (0.90, 0.10, 1.00, 0.70),
     }
 
     # ── Anomaly ────────────────────────────────────────────────
