@@ -30,3 +30,6 @@ install_torch.txt
 v1_reference/
 DATA/_demo/
 HANDOFF.md
+
+# the recorded test runs shown in the README are meant to be published
+!docs/testing/*.mp4

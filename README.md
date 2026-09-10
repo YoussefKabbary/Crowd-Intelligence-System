@@ -79,6 +79,47 @@ behind the video; it never freezes the window.
 
 ---
 
+## Testing
+
+Three recordings of real runs, each a single unbroken pass over the same
+promenade footage. Nothing is staged and no figure is edited in afterwards —
+every number on screen is produced live by the pipeline as the clip plays,
+including the ones that are unflattering.
+
+<table>
+<tr>
+<td width="50%">
+  <a href="docs/testing/01-full-walkthrough.mp4"><img src="docs/testing/poster-01.jpg" alt="Full walkthrough: detection, gate counting, zones, heatmap, anomaly clips"></a>
+  <p><b>Full walkthrough</b> · 40 s<br>
+  <sub>Every capability in turn, captioned as it appears: detection and tracking,
+  gate counting, per-zone occupancy, the density heatmap, and an anomaly with its
+  clip saved. Closes on the actual report and CSV rows the run wrote out.</sub></p>
+</td>
+<td width="50%">
+  <a href="docs/testing/02-short-overview.mp4"><img src="docs/testing/poster-02.jpg" alt="Short overview of the running system"></a>
+  <p><b>Short overview</b> · 20 s<br>
+  <sub>The same run, condensed. Useful if you only want to see that the thing
+  runs and what the readout looks like while it does.</sub></p>
+</td>
+</tr>
+<tr>
+<td colspan="2">
+  <a href="docs/testing/03-before-after.mp4"><img src="docs/testing/poster-03.jpg" alt="v1 and v2 running side by side on identical frames"></a>
+  <p><b>Before and after</b> · 16 s<br>
+  <sub>v1 on the left, v2 on the right, fed identical frames. The count differs
+  because v1's non-maximum suppression discarded the weakest detection on every
+  frame by construction — see <a href="AUDIT.md">AUDIT.md</a>.</sub></p>
+</td>
+</tr>
+</table>
+
+Recorded with `tools/make_demo.py`, which drives the same code path as a normal
+run. To reproduce any of them:
+
+```bash
+venv\Scripts\python.exe tools\make_demo.py --showcase --video your_clip.mp4
+```
+
 ## Honest limits
 
 This project keeps its measurements in the open, including the unflattering ones.
@@ -334,6 +375,8 @@ Everything lands in `DATA/` (or `CROWD_MASTER_DATA_DIR`):
 | `tests/test_gate_counting.py` | gate-counting regression test |
 | `tests/measure_accuracy.py` | accuracy against hand-counted frames |
 | `tools/extract_frames.py` | pulls frames out for hand-counting |
+| `tools/make_demo.py` | records the clips in [Testing](#testing) |
+| `docs/testing/` | those recordings, and their poster frames |
 | `AUDIT.md` | code review: defects, measurements, what is outstanding |
 
 ## Notes

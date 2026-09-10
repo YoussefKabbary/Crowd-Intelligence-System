@@ -4,8 +4,6 @@ Full review of v5.2, everything reproduced by running the code on the target
 machine (RTX 3050 Laptop, CUDA 13.0, torch 2.11.0+cu130, ultralytics 8.4.99).
 The result is v5.3.
 
-Full report: <https://claude.ai/code/artifact/ecab8e47-47ed-4332-8281-c561e5a08321>
-
 ---
 
 ## Headline results
