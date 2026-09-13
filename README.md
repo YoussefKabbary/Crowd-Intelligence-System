@@ -15,11 +15,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Crowd Master running: detection, gate counting, zone occupancy and heatmap" width="820">
+  <img src="docs/demo.gif" alt="Crowd Master: detection, gate counting, zones, heatmap, zoom, enhancement, fast forward and screenshots" width="720">
 </p>
 
 <p align="center">
-  <sub>One pass over real CCTV footage. Every number on screen is produced live by the pipeline.</sub>
+  <sub>Eight short cuts from real footage, one per capability. Every box and number on screen is produced live by the pipeline.</sub>
 </p>
 
 ---
