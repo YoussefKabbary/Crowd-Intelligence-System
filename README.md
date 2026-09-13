@@ -106,9 +106,10 @@ including the ones that are unflattering.
 <td colspan="2">
   <a href="docs/testing/03-before-after.mp4"><img src="docs/testing/poster-03.jpg" alt="v1 and v2 running side by side on identical frames"></a>
   <p><b>Before and after</b> · 16 s<br>
-  <sub>v1 on the left, v2 on the right, fed identical frames. The count differs
-  because v1's non-maximum suppression discarded the weakest detection on every
-  frame by construction — see <a href="AUDIT.md">AUDIT.md</a>.</sub></p>
+  <sub>v1's settings on the left (YOLOv8n at 640×360), v2's on the right (YOLOv8s
+  at 960×540), both running the current code on identical frames. What differs
+  is the model and resolution; the defects fixed in v2 are documented in
+  <a href="AUDIT.md">AUDIT.md</a>.</sub></p>
 </td>
 </tr>
 </table>
