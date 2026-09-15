@@ -4358,6 +4358,19 @@ def run(cfg: Config):
         # Drawing after the resize means text is rendered at the size it is
         # actually viewed at. Box, head, zone and gate coordinates are in video
         # space, so they are scaled by the same factor. ~2.7 ms for 640x360.
+        # Heatmap and enhancement are per-pixel, so they run here at the video's
+        # own resolution, before the upscale. Done after it, they processed four
+        # times the pixels on a 640x360 clip and the display fell to ~10 fps
+        # whenever either was switched on.
+        all_centers = (list(snap.head_centers or []) + list(snap.orphan_heads or []))
+        heatmap.update(all_centers)
+        if show_heatmap:
+            display = heatmap.render(display, alpha=0.55)
+        if enhance_mode:
+            display = PanZoomView._enhance_pass(
+                display,
+                strength=0.5 if pz.zoom <= 1.0 else min(1.2, 0.5 + (pz.zoom - 1.0) * 0.25))
+
         vs = 1.0
         if cfg.HUD_MIN_WIDTH and display.shape[1] < cfg.HUD_MIN_WIDTH:
             vs = cfg.HUD_MIN_WIDTH / display.shape[1]
@@ -4365,11 +4378,6 @@ def run(cfg: Config):
                 display,
                 (cfg.HUD_MIN_WIDTH, int(round(display.shape[0] * vs))),
                 interpolation=cv2.INTER_LINEAR)
-
-        all_centers = (list(snap.head_centers or []) + list(snap.orphan_heads or []))
-        heatmap.update(all_centers)
-        if show_heatmap:
-            display = heatmap.render(display, alpha=0.55)
 
         if show_boxes and snap.body_boxes is not None and len(snap.body_boxes) > 0:
             draw_boxes(display, np.asarray(snap.body_boxes) * vs,
@@ -4390,7 +4398,7 @@ def run(cfg: Config):
         # transform and travel with the footage.
         gate_mgr.draw_preview(display, scale=vs)
 
-        display = pz.apply(display, enhance=enhance_mode)
+        display = pz.apply(display, enhance=False)  # enhancement already applied above
 
         # ★ FIX: the dashboard used to be drawn before pz.apply(), so zooming in
         # magnified and cropped the stats panel along with the video. The HUD is
