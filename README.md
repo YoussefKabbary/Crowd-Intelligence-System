@@ -104,18 +104,21 @@ including the ones that are unflattering.
 </tr>
 <tr>
 <td colspan="2">
-  <a href="docs/testing/03-before-after.mp4"><img src="docs/testing/poster-03.jpg" alt="v1 and v2 running side by side on identical frames"></a>
-  <p><b>Before and after</b> · 16 s<br>
-  <sub>v1's settings on the left (YOLOv8n at 640×360), v2's on the right (YOLOv8s
-  at 960×540), both running the current code on identical frames. What differs
-  is the model and resolution; the defects fixed in v2 are documented in
-  <a href="AUDIT.md">AUDIT.md</a>.</sub></p>
+  <a href="docs/testing/03-v1-vs-v2.mp4"><img src="docs/testing/poster-03.jpg" alt="v1 and v2 actually running side by side on the same video"></a>
+  <p><b>v1 vs v2, both actually running</b> · 47 s<br>
+  <sub>The v1 code as first published on GitHub on the left, v2 on the right, fed
+  the same video and the same key presses (zones, heatmap, zoom, enhancement,
+  speed, screenshot), recorded from each version's own window with
+  <code>tools/record_window.py</code>. The published v1 file needed one stray line
+  removed to start at all; nothing else was changed. The closing card shows the
+  detection times measured in that run.</sub></p>
+  <img src="docs/testing/start-screen-v1-v2.png" alt="Start screens of v1 and v2 side by side: v2 adds webcam and IP/RTSP sources" width="100%">
 </td>
 </tr>
 </table>
 
-Recorded with `tools/make_demo.py`, which drives the same code path as a normal
-run. To reproduce any of them:
+The first two were recorded with `tools/make_demo.py`, which drives the same code
+path as a normal run. To reproduce them:
 
 ```bash
 venv\Scripts\python.exe tools\make_demo.py --showcase --video your_clip.mp4
@@ -378,6 +381,7 @@ Everything lands in `DATA/` (or `CROWD_MASTER_DATA_DIR`):
 | `tools/extract_frames.py` | pulls frames out for hand-counting |
 | `tools/make_demo.py` | records the clips in [Testing](#testing) |
 | `docs/testing/` | those recordings, and their poster frames |
+| `tools/record_window.py` | runs any version unmodified and records exactly what its window shows |
 | `AUDIT.md` | code review: defects, measurements, what is outstanding |
 
 ## Notes
