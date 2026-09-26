@@ -1,21 +1,19 @@
-MIT License
+Copyright (c) 2026 Youssef Kabbary. All rights reserved.
 
-Copyright (c) 2026 Youssef Kabbary
+Crowd Master, its source code, documentation, images and videos, are the
+property of Youssef Kabbary.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+No part of it may be copied, modified, redistributed, deployed, or used to
+build a product or service, commercial or not, without prior written
+permission from the author. Viewing it on GitHub and linking to it are
+welcome.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Third-party components keep their own licenses: the Python packages in
+requirements.txt, among them Ultralytics YOLO (AGPL-3.0), and any model
+weights downloaded from their publishers.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Versions of this repository published before 26 September 2026 were
+released under the MIT License; copies taken under that license keep it.
+Everything from that date on is covered by the notice above.
+
+Contact: https://www.linkedin.com/in/youssef-kabbary/
